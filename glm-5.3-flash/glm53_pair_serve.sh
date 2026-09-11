@@ -81,6 +81,14 @@ if grep -Ev '^[[:space:]]*(#|$)' "$env_file" \
   die "environment file contains unresolved placeholders: $env_file"
 fi
 
+# Values may not contain whitespace: the file is both sourced by this shell
+# (a space ends the assignment and runs the remainder as a command) and passed
+# to docker --env-file (which keeps trailing comments as part of the value).
+if grep -nE '^[A-Z][A-Z0-9_]*=[^#]*[[:space:]]' "$env_file" | grep -vE '^[0-9]+:[A-Z][A-Z0-9_]*=[[:space:]]*$' | head -3 | grep -q .; then
+  grep -nE '^[A-Z][A-Z0-9_]*=[^#]*[[:space:]]' "$env_file" | grep -vE '^[0-9]+:[A-Z][A-Z0-9_]*=[[:space:]]*$' | head -3 >&2
+  die "environment file has values containing whitespace or trailing comments (lines above); quote nothing, put comments on their own line"
+fi
+
 # shellcheck disable=SC1090
 . "$env_file"
 
@@ -299,6 +307,8 @@ require_unit_fraction() {
 : "${INSTANTTENSOR_IO_DEPTH:=3}"
 : "${INSTANTTENSOR_CONCURRENCY:=1}"
 : "${INSTANTTENSOR_CHUNK_SIZE:=8388608}"
+: "${API_KEY:=}"                       # empty = open port; set to require Authorization: Bearer <key> on rank 0 (from the template)
+: "${ENABLE_FLASHINFER_AUTOTUNE:=0}"   # 0 = --no-enable-flashinfer-autotune (canonical GLM recipe; B12X owns attention/MoE/linear); 1 = tune FlashInfer kernels at startup
 : "${MOE_BACKEND:=b12x}"               # b12x (qualified; the engine default since r34/#728) | humming | auto
 : "${ATTENTION_BACKEND:=B12X}"          # B12X (qualified GLM sparse-MLA + GDN path) | auto
 : "${LINEAR_BACKEND:=b12x}"            # restrict linear kernels to the b12x set
@@ -533,6 +543,8 @@ esac
 # the target's quantized linears and a DFlash MXFP8 draft both stay on
 # sparkinfer kernels instead of flashinfer auto-selection (which has an
 # unresolved CUTLASS SM121 MMA guard on GB10).
+case "$API_KEY" in *[[:space:]]*) die "API_KEY must not contain whitespace" ;; esac
+require_bool ENABLE_FLASHINFER_AUTOTUNE
 case "$MOE_BACKEND" in b12x|humming|auto) : ;; *) die "MOE_BACKEND must be b12x, humming, or auto: $MOE_BACKEND" ;; esac
 case "$ATTENTION_BACKEND" in B12X|auto) : ;; *) die "ATTENTION_BACKEND must be B12X or auto: $ATTENTION_BACKEND" ;; esac
 case "$LINEAR_BACKEND" in
@@ -911,7 +923,6 @@ command=(
   --linear-backend "$LINEAR_BACKEND"
   "${lm_only_args[@]}"
   --mamba-cache-mode align
-  --no-enable-flashinfer-autotune
   --load-format "$LOAD_FORMAT"
   --compilation-config "$compilation_config"
   --max-cudagraph-capture-size "$MAX_CUDAGRAPH_CAPTURE_SIZE"
@@ -939,12 +950,14 @@ command=(
 if [ "$TRUST_REMOTE_CODE" = 1 ]; then command+=(--trust-remote-code); fi
 if [ "$ENABLE_PREFIX_CACHING" = 1 ]; then command+=(--enable-prefix-caching); fi
 if [ "$ENABLE_CHUNKED_PREFILL" = 1 ]; then command+=(--enable-chunked-prefill); fi
+if [ "$ENABLE_FLASHINFER_AUTOTUNE" = 1 ]; then command+=(--enable-flashinfer-autotune); else command+=(--no-enable-flashinfer-autotune); fi
 if [ -n "$KV_CACHE_MEMORY_BYTES" ]; then
   command+=(--kv-cache-memory-bytes "$KV_CACHE_MEMORY_BYTES")
 fi
 
 if [ "$NODE_RANK" = 0 ]; then
   command+=(--host 0.0.0.0 --port "$API_PORT")
+  [ -z "$API_KEY" ] || command+=(--api-key "$API_KEY")
 else
   command+=(--headless)
 fi
@@ -976,6 +989,7 @@ fi
 printf '  CUDAGRAPH_MODE:          %s (capture %s)\n' \
   "$CUDAGRAPH_MODE" "$MAX_CUDAGRAPH_CAPTURE_SIZE"
 printf '  LOAD_FORMAT:             %s\n' "$LOAD_FORMAT"
+printf '  API_KEY:                 %s\n' "$([ -n "$API_KEY" ] && echo 'set (Bearer required)' || echo 'none (open port)')"
 printf '  command:'
 printf ' %q' "${command[@]}"
 printf '\n'

@@ -1,0 +1,455 @@
+# =============================================================================
+# template-rank.env.example -- per-rank env for ONE RANK of a 2-node DGX Spark
+# pair (TP=2) served by an aarch64/sm_121 image from build-spark-cu132.sh
+# (local-inference-lab/vllm dev/jovian-judgement + B12X/SparkInfer).
+#
+# EVERY setting is explicit. Each line says what it does and what values are
+# accepted. Empty is a deliberate value: "the launcher omits the flag and the
+# engine uses its own default". The launcher validates everything at --check.
+#
+# FORMAT RULES (the file is sourced by the launcher AND passed to --env-file):
+#   - plain KEY=VALUE, no quotes; lists comma-separated, never spaces
+#   - no JSON -- sourcing strips its quotes; the launcher builds JSON instead
+#   - NEVER put a comment after a value: --env-file passes it into the container
+#   - <placeholder> in a non-comment line is refused at --check
+#
+# Copy once per node; only section 1 differs between the two files:
+#     cp MODEL-rank.env.example rank-0.env   # API node
+#     cp MODEL-rank.env.example rank-1.env   # headless worker
+# Validate: ./MODEL_pair_serve.sh --check rank-0.env
+# Start rank 1 first (it blocks on rank 0's rendezvous), then rank 0.
+#
+# Fill this header when instantiating (publishing checklist):
+#   Image:  <tag or immutable digest>
+#   Pins:   vLLM <sha> / sparkinfer <sha>   (copy from build.env)
+#   Measured: <date>, rank-0 boot on the pin above
+# Mark image-gated lines [head-MMDD+] so a rollback knows what to drop.
+# =============================================================================
+
+
+# =============================================================================
+# 1. REQUIRED -- resolve every <placeholder>. Read from THIS host; never copy
+#    fabric identity from another machine.
+# =============================================================================
+
+# 0 = API node (serves HTTP, coordinates); 1 = headless worker.
+NODE_RANK=<0_or_1>
+
+# Rank 0's IPv4 on the ConnectX-7 link. IDENTICAL in both files. The launcher
+# dies if it routes through a gateway (a one-digit typo otherwise hangs both
+# ranks forever with no error).
+MASTER_ADDR=<rank0_fabric_ipv4>
+
+# THIS node's IPv4 on the link. Rank 0: equal to MASTER_ADDR. Must be a local
+# address -- this is what catches running the wrong rank's file.
+VLLM_HOST_IP=<this_node_fabric_ipv4>
+
+# Snapshot dir holding config.json + weights. Byte-identical on both nodes
+# (rsync -c, or hash the files). Qualify checkpoint variants before pinning
+# one: a lighter/faster quantization can fail long-context tests.
+MODEL_HOST_PATH=<abs_path_to_model_snapshot>
+
+# Writable JIT/compile cache, at least four directory levels deep (--clear
+# wipes it and refuses shallow paths). Holds torch.compile, Triton,
+# FlashInfer, B12X artifacts. Do NOT set XDG_CACHE_HOME / TRITON_CACHE_DIR /
+# VLLM_CACHE_ROOT here -- the image fingerprints them per revision.
+CACHE_HOST_PATH=<abs_path_to_writable_cache>
+
+# The image both nodes carry (docker save | docker load keeps IDs identical).
+# Prefer an immutable digest once one exists.
+SERVING_IMAGE=<image_tag_or_digest>
+
+#   ip -br link  -> the interface on the CX7 link (NCCL and Gloo must match)
+NCCL_SOCKET_IFNAME=<fabric_ifname>
+GLOO_SOCKET_IFNAME=<fabric_ifname>
+#   ibv_devices  -> the RDMA device; exactly one under the single-rail profile
+NCCL_IB_HCA=<rdma_device>
+#   show_gids    -> the RoCEv2 IPv4 row's index. The #1 cause of silent NCCL
+#   hangs when copied from another machine.
+NCCL_IB_GID_INDEX=<rocev2_ipv4_gid_index>
+
+
+# =============================================================================
+# 2. SERVING SHAPE
+# =============================================================================
+
+# HTTP port on rank 0 / torch.distributed rendezvous port. Must differ.
+API_PORT=8000
+MASTER_PORT=29500
+
+# Names clients may send, comma-separated, no spaces. The first is what
+# /v1/models reports; add a second casing if clients 404 on a mismatch.
+SERVED_MODEL_NAME=<served_name_or_alias_list>
+
+# Empty = open port (bind is host-local only unless the host is exposed).
+# Set to require Authorization: Bearer <key> on rank 0.
+API_KEY=
+
+# Speculator: one of the launcher's SPECULATOR_CHOICES. A built-in draft head
+# needs no extra weights; a separate draft model needs the two keys below and
+# costs KV pool. none disables speculation.
+SPECULATOR=none
+
+# Draft depth. Fixed-block drafters have a correctness floor (fewer tokens
+# than one block produces wrong output) -- the launcher enforces the model's.
+NUM_SPECULATIVE_TOKENS=0
+
+# Adaptive depth (mtp-family speculators only; the model hook must append the
+# fields). 1 lets the engine vary depth between 1 and NUM_SPECULATIVE_TOKENS
+# from measured acceptance; 0 = fixed depth. GLM-5.3 measured: static 3 beat
+# adaptive at c1-c4 (acceptance 2.41 -> 2.60). INITIAL empty = min(3, depth);
+# WINDOW = verification steps per adjustment. Both apply only when =1.
+ADAPTIVE_SPECULATIVE_TOKENS=0
+ADAPTIVE_SPECULATIVE_TOKENS_INITIAL=
+ADAPTIVE_SPECULATIVE_TOKENS_WINDOW=32
+
+# Separate draft checkpoint; leave empty unless the speculator needs one.
+# Pin it by CONTENT: upstream re-quantizes under the same name, and a path
+# proves nothing about which bytes a node holds. The launcher hashes the file
+# and refuses a mismatch, so both ranks provably agree.
+#   sha256sum <draft_dir>/*.safetensors
+DRAFT_MODEL_HOST_PATH=
+DRAFT_WEIGHTS_SHA256=
+
+# Context ceiling. Never `auto` (resolves to the checkpoint maximum and
+# starves the pool). One request of this length must fit the KV pool.
+MAX_MODEL_LEN=<measured_context_ceiling>
+
+# Concurrent sequences. A decode step is MAX_NUM_SEQS x (depth+1) tokens and
+# must fit MAX_CUDAGRAPH_CAPTURE_SIZE or the largest batches fall out of graph
+# replay. Raising both together costs ~2 GiB more graph memory.
+MAX_NUM_SEQS=8
+
+# Tokens per engine step = prefill chunk. Larger chunks prefill faster per
+# chunk but cost a larger transient activation peak (unified memory: the
+# same pool as KV) and can cliff at long context. Measure per model; never
+# inherit a value from another model (GLM-5.3: 4096 flat ~1.9k tok/s
+# 32k-128k; 8192 peaked 2.06k at 64k and fell to 1.5k at 128k).
+MAX_NUM_BATCHED_TOKENS=4096
+
+# Largest captured decode batch.
+MAX_CUDAGRAPH_CAPTURE_SIZE=96
+
+# FULL captures decode only (hybrid/GDN backends downgrade it to
+# FULL_DECODE_ONLY and prefill runs eager). FULL_AND_PIECEWISE adds piecewise
+# prefill graphs: faster prefill, ~2 GiB static. Also PIECEWISE, NONE.
+CUDAGRAPH_MODE=FULL_AND_PIECEWISE
+
+# Prefix cache reuse / chunked long prefills. Both 1 on every qualified recipe.
+ENABLE_PREFIX_CACHING=1
+ENABLE_CHUNKED_PREFILL=1
+
+# FlashInfer startup autotune. Empty = omit the flag (engine default); 0 =
+# --no-enable-flashinfer-autotune (the GLM recipe: B12X owns attention, MoE and
+# linear, so there is nothing of consequence to tune and 1 only costs startup
+# time and JIT work); 1 = --enable-flashinfer-autotune (the DeepSeek recipe).
+# The --ir-op-priority.rms_norm / fused_add_rms_norm=vllm_c flags seen in
+# some launchers are already this fork's defaults; nothing to set.
+ENABLE_FLASHINFER_AUTOTUNE=
+
+# 1 only if the checkpoint ships modeling code the image lacks.
+TRUST_REMOTE_CODE=0
+
+# Public block-table unit. Hybrids override the physical page anyway (the
+# coupled default, or the split-page geometry). Upstream's TP2 launcher
+# uses 16; 256 is the value these launchers were qualified with.
+BLOCK_SIZE=256
+
+# --- prefill/decode contention: two alternative answers, use one ----------
+# Admit new prefill only every N engine steps, so a long prefill cannot starve
+# an active decode (upstream #546 measured 43 -> 199 tok/s decode during a 64k
+# prefill, that prefill ~26% slower). 1 = every step. Empty = flag omitted.
+PREFILL_SCHEDULE_INTERVAL=
+# Compute-share scheduler instead: FAIRNESS_ENGINE=compute_share with
+# PREFILL_COMPUTE_SHARE=0.40 and the interval at 1. Other engine:
+# micro_slicing. Empty = off. [r26 image+]
+FAIRNESS_ENGINE=
+PREFILL_COMPUTE_SHARE=
+
+# Recurrent-state retention for prefix caching -- HYBRID/RECURRENT MODELS
+# ONLY; empty on a pure attention model. A checkpoint is a saved "resume
+# here" state; a hybrid needs the recurrent state as well as attention KV, so
+# matching tokens alone are not enough.
+#   request_boundaries: checkpoints at system-prompt end, full input, and
+#     committed response. Fewest retained states; right for chat and agents.
+#     Prompts diverging INSIDE a long user message find no nearby checkpoint.
+#   aligned: a checkpoint every recurrent block, including mid-message -- two
+#     prompts sharing 9,000 tokens resume from the last block boundary. For
+#     long documents; costs more retained state.
+#   auto: engine picks. GPU-local either way; nothing touches disk.
+RECURRENT_CHECKPOINT_POLICY=
+
+
+# =============================================================================
+# 3. MEMORY
+# =============================================================================
+
+# Pinned KV(+recurrent) pool in bytes. Bypasses profiling and makes
+# GPU_MEMORY_UTILIZATION inert. Measure it: boot once with this empty, read
+# "Available KV cache memory", pin that. Node static + pin + the prefill
+# transient peak must stay under 121.7 GiB. For hybrids the recurrent state
+# shares this reservation -- never carry a number over from another model.
+KV_CACHE_MEMORY_BYTES=
+
+# Inert while the pin is set; governs pool sizing only if the pin is removed.
+# GB10 unified memory: ~121.7 GiB total, ~10.5 GiB held by the OS, so vLLM
+# refuses above ~0.913, and page cache counts against CUDA free memory.
+GPU_MEMORY_UTILIZATION=0.90
+
+# One of the launcher's KV_CACHE_DTYPE_CHOICES. fp8 is the qualified layout
+# for B12X attention (the engine selects the packed format internally); newer
+# pins add fp8_ds_mla and nvfp4_ds_mla (half the bytes, quality-gated).
+KV_CACHE_DTYPE=fp8
+
+# Host free-memory gate at --check: die (default) refuses when MemFree is
+# short of what vLLM's own startup gate reads; warn proceeds; off skips.
+# Only runs in profiling mode (no KV pin).
+MEM_PREFLIGHT=die
+
+# cgroup cap so a runaway load kills the container, not the host. Empty =
+# unlimited. On GB10 this counts the GPU-visible allocation too, so set it
+# above model + pool or the kernel OOM-kills the load before vLLM reports.
+CONTAINER_MEMORY_GB=
+
+
+# =============================================================================
+# 4. MULTIMODAL -- only honoured when the launcher's MODEL_MULTIMODAL=1
+# =============================================================================
+
+# 1 skips the vision encoder cache and the max-size video profile item
+# (several GiB of pool); 0 serves images/video. Re-measure the KV pin after
+# switching to 0.
+LANGUAGE_MODEL_ONLY=1
+
+# 1 = cap items per PROMPT from the two below (the whole chat history counts:
+# an agent loop returning screenshots hits the cap in a few turns). 0 = omit
+# the cap (engine default 999 per modality, bounded only by MAX_MODEL_LEN).
+# With the KV pin set neither costs static memory; the cap governs per-request
+# preprocessing, encoder work and context only.
+LIMIT_MM=1
+
+# Integers on purpose (JSON here loses its quotes; the launcher builds it).
+# 0 disables that modality -- MM_VIDEOS=0 drops the max-size video profile
+# item, which is most of the vision reservation.
+MM_IMAGES=4
+MM_VIDEOS=0
+
+# Host-RAM cache of PREPROCESSED media, so a repeated image skips
+# resize/patchify. The engine default is 4 GiB per process (API server +
+# engine) -- on unified memory that is the same pool as KV. 0 disables it;
+# prompts are unaffected, only repeated media is reprocessed.
+MM_PROCESSOR_CACHE_GB=0
+
+# data = each rank holds the full encoder and encodes its own items (no
+# encoder collectives over RoCE); weights = engine default, encoder split
+# across ranks with a collective at every encoder layer. Empty = default.
+MM_ENCODER_TP_MODE=
+
+
+# =============================================================================
+# 5. KERNELS AND BACKENDS
+# =============================================================================
+
+# GB10 is sm_121. The launcher refuses anything else: sm_120a silently builds
+# RTX Pro 6000 CuTeDSL kernels that compile and then fail at load.
+CUTE_DSL_ARCH=sm_121a
+FLASHINFER_CUDA_ARCH_LIST=12.1f
+
+# Kernel backends, explicit. b12x/B12X is the sparkinfer set this image is
+# built for; auto may select FlashInfer kernels not qualified on sm_121.
+MOE_BACKEND=b12x
+ATTENTION_BACKEND=B12X
+LINEAR_BACKEND=b12x
+
+# KDA/GDN prefill backend -- HYBRID MODELS ONLY, empty otherwise. flashkda =
+# the in-tree extension (confirm _flashkda_C is built for sm_121); auto falls
+# back to Triton silently if it is missing; b12x = native path. [head-0903+]
+KDA_PREFILL_BACKEND=
+
+# KDA/GDN decode kernel -- hybrid models only. Empty = the engine resolver
+# (B12X live-tensor when eligible, Triton otherwise, never visible in a log);
+# b12x pins it explicitly. Also cuda, triton. [head-0903+]
+GDN_DECODE_KERNEL=
+
+# torch.compile level: empty = none (CUDA graphs only, the qualified path);
+# 0-3 passes -O<N>. Inductor cannot fuse into B12X or vLLM custom ops, so the
+# expected gain is small and compile time on Grace is minutes. A/B only.
+COMPILATION_LEVEL=
+
+# Sampling defaults: auto = the checkpoint's generation_config.json (what
+# benchmarks normally run under); vllm = engine-neutral defaults, which lowers
+# speculative acceptance.
+GENERATION_CONFIG=auto
+
+# Sampling overrides, applied via --override-generation-config. Empty = leave
+# GENERATION_CONFIG's resolution alone. Set these only to deviate from the
+# publisher's values, or for a checkpoint whose config lacks them.
+# Per-request sampling fields still win.
+SAMPLING_TEMPERATURE=
+SAMPLING_TOP_P=
+SAMPLING_TOP_K=
+SAMPLING_MIN_P=
+SAMPLING_REPETITION_PENALTY=
+
+# Optional custom chat template, mounted read-only at
+# /models/chat_template.jinja. Empty = the checkpoint's own.
+CHAT_TEMPLATE_HOST_PATH=
+
+# Host dir for torch profiler traces; empty = disabled. Set to enable POST
+# /start_profile and /stop_profile (mounted at /profiles). Traces are large.
+TORCH_PROFILE_HOST_DIR=
+
+# Model-family kernel toggles go here (MoE activation width, quantization
+# class, LM-head quantization, policy mode, speculator backends). Each is an
+# unknown-env warning at worst on an image that predates it, but a wrong value
+# is silent: verify the choice in the startup log via --verify.
+#<MODEL_KERNEL_KEY>=<value>
+
+
+# =============================================================================
+# 6. COLLECTIVES
+# =============================================================================
+
+# RoCEnante: routes TP all-reduces <= ALLREDUCE_MAX_SIZE and all-gather shards
+# <= ALLGATHER_MAX_SIZE through b12x.comm.roce; NCCL keeps the rest. Size the
+# cutoff to one prefill chunk's per-layer reduce
+# (MAX_NUM_BATCHED_TOKENS x hidden x dtype bytes) or prefill stays on NCCL.
+# 0 = NCCL for everything. The proxy compiles at first boot into the cache dir
+# (keep it under /cache or it recompiles every boot). HCA and GID fall back to
+# the NCCL_IB_* values. [R17-RoCE / head images]
+VLLM_ENABLE_ROCE_ALLREDUCE=0
+VLLM_ROCE_ALLREDUCE_MAX_SIZE=16777216
+VLLM_ROCE_ALLGATHER_MAX_SIZE=16777216
+B12X_ROCE_CACHE_DIR=/cache/jit/b12x-roce
+
+# The B12X PCIe allreduce is a single-node PCIe P2P path. On a pair every TP
+# allreduce crosses the CX7 link; the image bakes 1, this overrides to 0 and
+# the launcher refuses 1.
+VLLM_ENABLE_PCIE_ALLREDUCE=0
+
+
+# =============================================================================
+# 7. LOADER AND RUNTIME
+# =============================================================================
+
+# instanttensor (~2.5 GB/s on Spark NVMe) is the qualified loader. Others:
+# fastsafetensors, auto, safetensors, and b12x (needs VLLM_PLUGINS=b12x_loader;
+# very fast loads but measure steady-state throughput before adopting it --
+# the loader's storage mode has cost prefill on GB10).
+LOAD_FORMAT=instanttensor
+
+# InstantTensor-ONLY staging bounds; inert under any other loader, and the
+# launcher passes them only when it is selected. BUFFER_SIZE must exceed the
+# checkpoint's largest tensor or the loader enlarges it on every boot (check
+# the load log for the largest tensor's byte count).
+INSTANTTENSOR_BUFFER_SIZE=1342177280
+INSTANTTENSOR_IO_DEPTH=3
+INSTANTTENSOR_CONCURRENCY=1
+INSTANTTENSOR_CHUNK_SIZE=8388608
+INSTANTTENSOR_BACKEND=BUFFERED
+# auto = engine default. 0/1 are rejected by pins >= 6575b5ac (the option was
+# removed; use LOAD_FORMAT=fastsafetensors instead).
+INSTANTTENSOR_COPY=auto
+SAFETENSORS_FAST_GPU=1
+
+# Fully offline: the model resolves from the mount only.
+HF_HOME=/root/.cache/huggingface
+HF_HUB_OFFLINE=1
+TRANSFORMERS_OFFLINE=1
+VLLM_NO_USAGE_STATS=1
+
+# Empty = no plugins. Set b12x_loader only with LOAD_FORMAT=b12x.
+VLLM_PLUGINS=
+# fork + CUDA is unsafe; spawn is required.
+VLLM_WORKER_MULTIPROC_METHOD=spawn
+
+# Compat shim FIRST (image kernels are CUDA 13.2; the host driver exports
+# older -- without it every process dies at import with "undefined symbol:
+# cuTensorMapEncodeTiled"), then the patched NCCL for the switchless pair.
+# The launcher verifies both paths exist inside the image.
+LD_PRELOAD=/usr/local/cuda/compat/libcuda.so.1:/opt/libnccl-local-inference.so.2.30.4
+VLLM_NCCL_SO_PATH=/opt/libnccl-local-inference.so.2.30.4
+NCCL_LOCAL_INFERENCE_PATH=/opt/libnccl-local-inference.so.2.30.4
+NCCL_PR2127_PATH=/opt/libnccl-local-inference.so.2.30.4
+TORCH_USE_RTLD_GLOBAL=1
+
+# JIT toolchain: Triton uses the image's CUDA 13.2 ptxas, not its bundled one.
+CUDA_HOME=/usr/local/cuda
+TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
+
+# Allocator: expandable segments, required alongside NCCL_CUMEM_ENABLE=0.
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+CUDA_DEVICE_ORDER=PCI_BUS_ID
+CUDA_DEVICE_MAX_CONNECTIONS=32
+
+# Grace CPU threads for torch. 2 avoids torch's spin-wait warning under
+# serving; upstream's TP2 launcher uses 16 (difference unmeasured).
+OMP_NUM_THREADS=2
+
+# docker or podman.
+CONTAINER_RUNTIME=docker
+# Optional suffix so two env files can run side by side on one host (A/B).
+CONTAINER_NAME_SUFFIX=
+
+
+# =============================================================================
+# 8. FABRIC -- RoCEv2 over the direct link; launcher-enforced
+# =============================================================================
+
+# single = ONE cable between the nodes (the launcher then requires the two
+# knobs below at 0 and a single device in NCCL_IB_HCA). dual = BOTH CX7 ports
+# cabled node-to-node: set MERGE_NICS=1, SUBNET_AWARE_ROUTING=1 and list both
+# rails in NCCL_IB_HCA for ~2x cross-node bandwidth. Selecting dual without
+# the second cable makes NCCL advertise a rail that cannot carry traffic.
+FABRIC_PROFILE=single
+
+# RoCE presents IB semantics over Ethernet: IB is correct. The image bakes
+# NCCL_IB_DISABLE=1 for single-node boxes; this overrides it, and without the
+# override the pair silently falls back to TCP sockets.
+NCCL_NET=IB
+NCCL_NET_PLUGIN=none
+NCCL_IB_DISABLE=0
+
+# Single-rail: 0/0 (validated). Upstream's single-rail launcher runs
+# SUBNET_AWARE_ROUTING=1 with MERGE_NICS=0 -- allowed, warned, unmeasured.
+NCCL_IB_SUBNET_AWARE_ROUTING=0
+NCCL_IB_MERGE_NICS=0
+
+# Qualified protocol/topology set for the direct-cable pair.
+NCCL_PROTO=LL,LL128,Simple
+NCCL_P2P_LEVEL=SYS
+NCCL_CROSS_NIC=1
+
+# NCCL's CUDA VMM allocator conflicts with expandable_segments: keep 0.
+NCCL_CUMEM_ENABLE=0
+
+# Grace's unified layout defeats NCCL's NUMA guesses.
+NCCL_IGNORE_CPU_AFFINITY=1
+
+# WARN for serving. INFO names the transport per channel (NET/IB vs
+# NET/Socket) when debugging a hang or confirming RoCE is in use.
+NCCL_DEBUG=WARN
+
+
+# =============================================================================
+# BRING-UP ORDER (once per model + pin; record the numbers in the header)
+#
+# 1. Profile: KV_CACHE_MEMORY_BYTES empty, GPU_MEMORY_UTILIZATION 0.88-0.90,
+#    MAX_NUM_BATCHED_TOKENS low, speculator as intended. The profiling peak
+#    scales with the batch, so start small.
+# 2. From the rank-0 log take: "Available KV cache memory" -> the byte pin;
+#    "GPU KV cache size: N tokens" -> must exceed MAX_MODEL_LEN; "Maximum
+#    concurrency for L tokens" -> real concurrency; bytes/tokens -> per-token
+#    cost (hybrids include recurrent pages and padding layers).
+# 3. Pin the bytes, then raise MAX_NUM_BATCHED_TOKENS (no longer bounded by
+#    the profiling peak) and confirm the pool line did not move.
+# 4. Set MAX_MODEL_LEN under the pool with margin; set MAX_NUM_SEQS so
+#    MAX_NUM_SEQS x (depth+1) <= MAX_CUDAGRAPH_CAPTURE_SIZE.
+# 5. --verify: confirm the qualified kernel/speculator lines are in the log. A
+#    server that answers /health can still be on a fallback path.
+# 6. Change ONE knob per boot. Raising capture size and batch together with
+#    vision on has OOM'd graph capture.
+# 7. Any change of speculator, vision mode, loader, or pin invalidates 2-4:
+#    re-measure. A benchmark JSON and an env file describing different boots
+#    must never be published together.
+# =============================================================================
