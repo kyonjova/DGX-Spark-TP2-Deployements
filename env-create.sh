@@ -7,8 +7,8 @@
 #   2. (optionally) back up existing rank-*.env
 #   3. pick rank 0 (API node) or 1 (headless worker)
 #   4. answer the pair-wide fabric identity prompts (defaults from profiles/base.env)
-#   5. answer / reuse the model's three profile values
-#      (MODEL_HOST_PATH, CACHE_HOST_PATH, SERVING_IMAGE)
+#   5. answer / reuse the model's profile values (model + cache paths, serving
+#      image, API key, API port, served model name)
 #   6. writes deployments/<model>/rank-<rank>.env and runs the model's
 #      pair launcher --check on it when one exists.
 #
@@ -77,6 +77,48 @@ ask_yn() { # $1 = question -> sets yn in {y,n}
   done
 }
 
+ask_opt() { # $1 = prompt, $2 = default (optional); empty answer allowed -> $ans may be empty
+  local prompt=$1 def=${2:-} input
+  if [[ -n $def ]]; then
+    printf '%s [%s]: ' "$prompt" "$def"
+  else
+    printf '%s: ' "$prompt"
+  fi
+  IFS= read -r input || die "stdin closed while prompting"
+  input=${input%"${input##*[![:space:]]}"}
+  [[ -z $input && -n $def ]] && input=$def
+  ans=$input
+}
+
+ask_path() { # $1 = prompt, $2 = default; TAB completes paths when stdin is a terminal (readline)
+  local prompt=$1 def=${2:-} input pstr
+  if [[ -n $def ]]; then
+    pstr="$prompt [$def]: "
+  else
+    pstr="$prompt: "
+  fi
+  while :; do
+    if [[ -t 0 ]]; then
+      IFS= read -r -e -p "$pstr" input || die "stdin closed while prompting"
+    else
+      printf '%s' "$pstr" >&2
+      IFS= read -r input || die "stdin closed while prompting"
+    fi
+    input=${input%"${input##*[![:space:]]}"}
+    if [[ -z $input && -n $def ]]; then input=$def; fi
+    if [[ -n $input ]]; then ans=$input; return; fi
+    printf '  a value is required\n' >&2
+  done
+}
+
+# First value of a key in the chosen env example ("" if the line is absent or empty).
+example_value() { # $1 = key
+  local k v
+  while IFS=$'\t' read -r k v; do
+    if [[ $k == "$1" ]]; then printf '%s' "$v"; return; fi
+  done < <(read_kv_pairs "$env_example")
+}
+
 # Pick one item from a numbered list -> sets pick (1-based index).
 pick_from_list() { # $1 = question, rest = items
   local question=$1; shift
@@ -94,12 +136,10 @@ pick_from_list() { # $1 = question, rest = items
   done
 }
 
-# Rewrite every `^KEY=.*` line of $1 in place for the key/value pairs given on
-# stdin as `KEY<TAB>value`. awk for value-safety (no sed delimiter/& issues).
-apply_kv() { # $1 = file (rewritten in place)
-  local tmp
+apply_kv() { # $1 = mode (skip|append), $2 = file rewritten in place
+  local mode=$1 file=$2 tmp
   tmp=$(mktemp) || die "mktemp failed"
-  awk -F'\t' '
+  awk -F'\t' -v mode="$mode" -v fname="$file" '
     FILENAME == "-" {
       if (!($1 in k)) order[++n] = $1
       k[$1] = $2
@@ -117,10 +157,13 @@ apply_kv() { # $1 = file (rewritten in place)
     END {
       for (i = 1; i <= n; i++) {
         key = order[i]
-        if (!(key in seen)) print "env-create: note: no " key "= line in target file; value skipped" > "/dev/stderr"
+        if (!(key in seen)) {
+          if (mode == "append") print key "=" k[key]
+          else print "env-create: note: no " key "= line in " fname "; value skipped" > "/dev/stderr"
+        }
       }
     }
-  ' - "$1" <&0 > "$tmp" && mv "$tmp" "$1"
+  ' - "$file" <&0 > "$tmp" && mv "$tmp" "$file"
 }
 
 # --- 1. model menu -----------------------------------------------------------
@@ -240,27 +283,57 @@ done
 # --- 6. profile resolution ---------------------------------------------------
 profile=$profiles_dir/$stem-profile.env
 
-# Pull the three model fields, honoring seeding defaults, into kv answers.
+# Prompt the model's six values (paths + image + API key + port + served name),
+# honoring defaults from a seed source (an existing profile or rank-#.env),
+# with API_PORT / SERVED_MODEL_NAME falling back to the env example.
+# SERVED_MODEL_NAME is only recorded when it differs from the example value.
 model_fields=()
-collect_model_fields() { # $1 = seeding file ("" = none), $2 = "save"|"one-off"
+collect_model_values() { # $1 = defaults source ("" = none), $2 = "save"|"one-off"
   local seed=$1 mode=$2
-  local mh="" ch="" si=""
+  local mh="" ch="" si="" ak="" ap="" smn=""
   if [[ -n $seed ]]; then
     while IFS=$'\t' read -r k v; do
       case $k in
-        MODEL_HOST_PATH) mh=$v ;; CACHE_HOST_PATH) ch=$v ;; SERVING_IMAGE) si=$v ;;
+        MODEL_HOST_PATH)  mh=$v ;;
+        CACHE_HOST_PATH)  ch=$v ;;
+        SERVING_IMAGE)    si=$v ;;
+        API_KEY)          ak=$v ;;
+        API_PORT)         ap=$v ;;
+        SERVED_MODEL_NAME) smn=$v ;;
       esac
     done < <(read_kv_pairs "$seed")
   fi
+  [[ -n $ap ]] || ap=$(example_value API_PORT)
+  [[ -n $smn ]] || smn=$(example_value SERVED_MODEL_NAME)
   local desc="one-off (not saved)"
   [[ $mode == save ]] && desc="profiles/$stem-profile.env"
   printf 'model values -> %s\n' "$desc"
-  ask "MODEL_HOST_PATH (abs path to model snapshot)" "$mh"
+  ask_path "MODEL_HOST_PATH (abs path to model snapshot)" "$mh"
   model_fields+=("MODEL_HOST_PATH"$'\t'"$ans")
-  ask "CACHE_HOST_PATH (abs path to writable cache)" "$ch"
+  ask_path "CACHE_HOST_PATH (abs path to writable cache)" "$ch"
   model_fields+=("CACHE_HOST_PATH"$'\t'"$ans")
   ask "SERVING_IMAGE (tag or digest)" "$si"
   model_fields+=("SERVING_IMAGE"$'\t'"$ans")
+  ask_opt "API_KEY (empty = no API key)" "$ak"
+  model_fields+=("API_KEY"$'\t'"$ans")
+  while :; do
+    ask "API_PORT (HTTP port on rank 0)" "$ap"
+    if [[ $ans =~ ^[0-9]+$ ]] && (( 10#$ans >= 1 && 10#$ans <= 65535 )); then break; fi
+    printf '  enter a number between 1 and 65535\n' >&2
+  done
+  model_fields+=("API_PORT"$'\t'"$ans")
+  if [[ -n $smn ]]; then
+    ask_yn "Change SERVED_MODEL_NAME '$smn'?"
+    if [[ $yn == y ]]; then
+      ask "New SERVED_MODEL_NAME"
+      model_fields+=("SERVED_MODEL_NAME"$'\t'"$ans")
+    elif [[ $smn != "$(example_value SERVED_MODEL_NAME)" ]]; then
+      model_fields+=("SERVED_MODEL_NAME"$'\t'"$smn")
+    fi
+  else
+    ask "SERVED_MODEL_NAME"
+    model_fields+=("SERVED_MODEL_NAME"$'\t'"$ans")
+  fi
 }
 
 if [[ -f $profile ]]; then
@@ -270,16 +343,16 @@ if [[ -f $profile ]]; then
   for k in MODEL_HOST_PATH CACHE_HOST_PATH SERVING_IMAGE; do
     [[ -n ${prof[$k]:-} ]] || missing+=("$k")
   done
-  if (( ${#missing[@]} == 0 )); then
-    model_fields=("MODEL_HOST_PATH"$'\t'"${prof[MODEL_HOST_PATH]}" \
-                  "CACHE_HOST_PATH"$'\t'"${prof[CACHE_HOST_PATH]}" \
-                  "SERVING_IMAGE"$'\t'"${prof[SERVING_IMAGE]}")
-    printf 'using profile: %s\n' "$profile"
-  else
-    printf 'env-create: warning: %s is missing: %s — prompting one-off\n' \
+  if (( ${#missing[@]} > 0 )); then
+    printf 'env-create: warning: %s is missing: %s — prompting, then adding them\n' \
       "$profile" "${missing[*]}" >&2
-    collect_model_fields "" one-off
   fi
+  printf 'using profile: %s\n' "$profile"
+  collect_model_values "$profile" save
+  # persist the answered values (SERVED_MODEL_NAME only when changed) into the profile
+  { for pair in "${model_fields[@]}"; do printf '%s\n' "$pair"; done; } \
+    | apply_kv append "$profile"
+  printf 'updated: %s\n' "$profile"
 else
   printf 'no profile: %s\n' "$profile"
   ask_yn "Create it?"
@@ -304,7 +377,7 @@ else
       ask_yn "Seed from existing ${seed_file##*/}?"
       [[ $yn == y ]] && seed_mode=$seed_file
     fi
-    collect_model_fields "$seed_mode" save
+    collect_model_values "$seed_mode" save
     {
       printf '# %s — model values consumed by env-create.sh (env stem: %s).\n' "$stem-profile.env" "$stem"
       for pair in "${model_fields[@]}"; do
@@ -313,7 +386,7 @@ else
     } > "$profile"
     printf 'wrote: %s\n' "$profile"
   else
-    collect_model_fields "" one-off
+    collect_model_values "" one-off
   fi
 fi
 
@@ -333,7 +406,7 @@ esac
   printf 'VLLM_HOST_IP\t%s\n' "$vllm_host_ip"
   for pair in "${answers[@]}"; do printf '%s\n' "$pair"; done
   for pair in "${model_fields[@]}"; do printf '%s\n' "$pair"; done
-} | apply_kv "$tmp"
+} | apply_kv skip "$tmp"
 
 if grep -En '^[A-Z_0-9]+=.*<[A-Za-z0-9_]+>' "$tmp"; then
   printf 'env-create: unresolved placeholders remain in %s (see lines above)\n' "$target" >&2
