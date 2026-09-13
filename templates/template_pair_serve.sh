@@ -221,6 +221,25 @@ warn() {
   echo "${MODEL_ID} pair launcher: warning: $*" >&2
 }
 
+# Reclaim page cache: on GB10 CUDA free memory tracks MemFree, so page cache
+# left by a previous model load counts AGAINST vLLM's own startup gate (the
+# mem preflight below names the culprit). Used by the --fresh mode.
+drop_page_cache() {
+  if [ ! -e /proc/sys/vm/drop_caches ]; then
+    die "cannot drop page cache: /proc/sys/vm/drop_caches does not exist (not Linux?)"
+  fi
+  printf 'sync + drop_caches=3 (reclaiming page cache)...\n'
+  sync
+  if [ "$(id -u)" = 0 ]; then
+    echo 3 > /proc/sys/vm/drop_caches
+  elif command -v sudo >/dev/null 2>&1; then
+    printf '3' | sudo tee /proc/sys/vm/drop_caches >/dev/null
+  else
+    die "dropping page cache needs root; run as root or install sudo"
+  fi
+  awk '/^MemFree:/{printf "  MemFree after drop: %.1f GiB\n", $2/1048576}' /proc/meminfo
+}
+
 # Refuse to run as the template. Strip comments from the MODEL BLOCK and look
 # for an unresolved angle-bracket placeholder in code or data.
 self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
@@ -245,15 +264,16 @@ usage: $(basename "$0") [MODE] ENV_FILE [extra vllm args...]
   --logs      follow this rank's container logs
   --status    show this rank's container state
   --verify    grep this rank's log for the startup markers (+ /health on rank 0)
-  --clear     wipe CACHE_HOST_PATH contents (container must not exist)
+  --fresh     drop page cache (sync + sudo), then --run, then follow logs
 EOF
 }
 
 # ---------------------------------------------------------------- arguments
 
 mode=--check
+fresh_follow=0
 case "${1:-}" in
-  --check|--run|--restart|--down|--logs|--status|--clear) mode=$1; shift ;;
+  --check|--run|--restart|--down|--logs|--status|--verify|--fresh) mode=$1; shift ;;
   -h|--help)     usage; exit 0 ;;
   --*)           usage; exit 64 ;;
 esac
@@ -266,6 +286,16 @@ passthrough=("$@")
 [ -f "$env_file" ] || die "environment file is missing: $env_file"
 # Canonicalise now: later code cd's and docker --env-file needs the real path.
 env_file=$(cd "$(dirname "$env_file")" && pwd)/$(basename "$env_file")
+
+# --fresh reclaims page cache BEFORE anything else: the mem preflight below
+# reads MemFree, and on GB10 CUDA free memory tracks it. Then it behaves
+# exactly like --run, except the container is started without exec so the
+# launcher can follow the logs afterwards.
+if [ "$mode" = --fresh ]; then
+  drop_page_cache
+  mode=--run
+  fresh_follow=1
+fi
 
 # CRLF breaks the shell source and docker --env-file silently and differently.
 if grep -qU $'\r' "$env_file" 2>/dev/null; then
@@ -1148,4 +1178,14 @@ if "$CONTAINER_RUNTIME" container inspect "$container_name" >/dev/null 2>&1; the
   die "container already exists; remove it intentionally before relaunch: $container_name"
 fi
 
-exec "${command[@]}"
+
+# --fresh: started detached on purpose, so do NOT exec away the shell -- the
+# launcher follows the logs after the container is up. Ctrl-C detaches; the
+# container keeps running.
+if [ "$fresh_follow" = 1 ]; then
+  "${command[@]}"
+  printf '%s started; following logs (Ctrl-C detaches, the container keeps running)\n' "$container_name"
+  exec "$CONTAINER_RUNTIME" logs -f "$container_name"
+else
+  exec "${command[@]}"
+fi
