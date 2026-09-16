@@ -271,6 +271,14 @@ KDA_PREFILL_BACKEND=
 # b12x pins it explicitly. Also cuda, triton. [head-0903+]
 GDN_DECODE_KERNEL=
 
+# b12x startup selection search (b12x 77351c13+, the preparation lifecycle;
+# B12X_POLICY_MODE no longer exists -- b12x.policy and the embedded device
+# profiles were removed). 1 = measured search over
+# uncached b12x choices at startup (mandatory preparation always runs either
+# way). 0 = skip the search, default plans, faster boot -- boot-triage value;
+# measured-winner boots (published runs) keep it at 1.
+B12X_AUTOTUNE=1
+
 # torch.compile level: empty = none (CUDA graphs only, the qualified path);
 # 0-3 passes -O<N>. Inductor cannot fuse into B12X or vLLM custom ops, so the
 # expected gain is small and compile time on Grace is minutes. A/B only.

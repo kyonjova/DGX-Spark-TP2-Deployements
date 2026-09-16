@@ -102,8 +102,11 @@ MODEL_MULTIMODAL=1
 # Cosmetic only (no separate draft is ever hashed).
 DRAFT_SIZE_HINT="n/a"
 
-# No model-specific keys may be empty; the common allow-list covers the rest.
-MODEL_EMPTY_OK_KEYS=""
+# Model-specific keys that may be empty in the env file (still forwarded as
+# empty via --env-file; the engine reads an empty value as its default):
+#   B12X_AUTOTUNE — empty = run the b12x startup selection search (engine
+#   default 1; see deepseekv4vision-rank.env.example).
+MODEL_EMPTY_OK_KEYS="B12X_AUTOTUNE"
 
 # --verify markers that prove the QUALIFIED path, not just liveness:
 #   DeepseekV4ForConditionalGeneration  vision wrapper resolved (not text-only)
@@ -127,7 +130,7 @@ model_defaults() {
   : "${MAX_NUM_SEQS:=8}"
   : "${MAX_NUM_BATCHED_TOKENS:=8192}"        # upstream recipe; measured on the 0731 pair: 16384 gave no gain and shrank the pool
   : "${CUDAGRAPH_MODE:=FULL_AND_PIECEWISE}"  # upstream DSV4 recipes; the DSpark draft captures FULL graphs of its own
-  : "${LOAD_FORMAT:=fastsafetensors}"        # upstream since 6575b5a (2026-09-05); instanttensor OOMed the 0731 draft pass on this pair
+  : "${LOAD_FORMAT:=fastsafetensors}"        # upstream since 6575b5a (2026-09-05); the example overrides to instanttensor (OOM risk retired, see below)
   : "${TRUST_REMOTE_CODE:=1}"                # deepseek_v4 tokenizer/config classes
   : "${ENABLE_FLASHINFER_AUTOTUNE:=1}"       # upstream DSV4 recipes pass --enable-flashinfer-autotune
   : "${DSPARK_DRAFT_SAMPLE_METHOD:=probabilistic}"  # HF card + upstream; greedy one-hots the draft, which starves adaptive verification
@@ -203,8 +206,8 @@ model_validate() {
   # only). The engine ignores a video key, but the env file must not claim one.
   [ "$LANGUAGE_MODEL_ONLY" = 1 ] || [ "$MM_VIDEOS" = 0 ] \
     || die "DeepSeek-V4-Flash-Vision-Exp has no video modality; set MM_VIDEOS=0"
-  [ "$LOAD_FORMAT" != instanttensor ] \
-    || warn "LOAD_FORMAT=instanttensor OOMed the DSpark draft-model load pass on the 0731 pair (device staging headroom); upstream serves this family with fastsafetensors"
+  # LOAD_FORMAT=instanttensor is fine here: the 0731-era draft-load OOM no
+  # longer reproduces on current pins (user-verified, r37/r38 boots).
   # Toggles the DeepSeek-V4-Flash-0731 env carried that NOTHING reads on this
   # branch (grep of vllm HEAD a6571d0 and b12x HEAD 00b69ac, 2026-09-10).
   # Kernel selection is --attention-backend/--moe-backend/--linear-backend
