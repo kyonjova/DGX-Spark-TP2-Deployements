@@ -2,8 +2,17 @@
 # glm53_pair_serve.sh
 #
 # Validate or start one rank of a two-node DGX Spark pair serving
-# GLM-5.3-Flash-NVFP4 under vLLM (dev/jovian-judgement + B12X/SparkInfer),
-# with either the built-in MTP head or the DFlash2 draft model as speculator.
+# GLM-5.3-Flash-NVFP4 under vLLM (karmic-kraken, formerly dev/jovian-judgement,
+# + B12X/SparkInfer), with either the built-in MTP head or the DFlash2 draft
+# model as speculator.
+#
+# karmic-kraken (2026-09-20, vllm 57a8098 / b12x e9ce547): --fairness-engine is
+# gone (--prefill-compute-share stands alone and forbids an interval > 1),
+# the MTP draft MoE default is b12x, the qualified MTP contract is
+# probabilistic proposals + standard rejection, --max-model-len -1 auto-fits
+# to the KV pin, and --kda-decode-backend / --max-parallel-prefills /
+# --prefill-compute-half-life are new. Older pins reject the new flags; every
+# one of them is emitted only when its variable is set.
 #
 # The per-rank env file is both the host launch contract and the container
 # environment, so operator-facing paths and serving values have one source of
@@ -319,9 +328,17 @@ require_unit_fraction() {
 : "${CLEAR_THINKING:=}"                # empty = template default; 0 keeps client-supplied historical reasoning in the prompt (r30 agent profile); 1 strips it
 : "${KDA_PREFILL_BACKEND:=}"           # empty = engine default; b12x|flashkda|triton|auto (needs vllm pin >= 54371894e, 2026-09-03)
 : "${GDN_DECODE_KERNEL:=}"             # empty = engine default; b12x|cuda|triton (explicit KDA decode kernel; Luke's TP2 launcher pins b12x)
-: "${FAIRNESS_ENGINE:=}"               # empty = none; compute_share|micro_slicing (r26 scheduler; pairs with PREFILL_COMPUTE_SHARE)
+: "${FAIRNESS_ENGINE:=}"               # RETIRED on karmic-kraken (no --fairness-engine); must stay empty -- PREFILL_COMPUTE_SHARE stands alone
 : "${RECURRENT_CHECKPOINT_POLICY:=}"   # empty = engine default (auto); request_boundaries|aligned (vllm pin >= 52d9977b, 2026-09-05)
-: "${PREFILL_COMPUTE_SHARE:=}"         # fraction of contended execution for prefill; r26 qualifies 0.40 with compute_share
+: "${PREFILL_COMPUTE_SHARE:=}"         # empty = off; fraction in (0,1) or auto. Published GLM profile: 0.4 with PREFILL_SCHEDULE_INTERVAL=1 (KK rejects share + interval > 1)
+: "${PREFILL_COMPUTE_HALF_LIFE:=}"     # KK: only with PREFILL_COMPUTE_SHARE=auto; seconds, or smooth (2 s) | responsive (0.5 s)
+: "${MAX_PARALLEL_PREFILLS:=}"         # KK: empty = engine default (1); positive integer or auto. Published GLM profile: 1
+: "${KDA_DECODE_BACKEND:=}"            # KK: empty = engine default (auto); auto|native|flashinfer|triton (--kda-decode-backend; the published profile passes glm53_kda_decode_backend=auto)
+: "${DRAFT_SAMPLE_METHOD:=probabilistic}" # mtp/dflash2 draft sampling: probabilistic (published GLM contract; full draft logits in the ratio test, more GPU memory) | greedy (engine default, what JJ ran)
+: "${REJECTION_SAMPLE_METHOD:=standard}"  # standard (published) | block | synthetic
+: "${DFLASH_ATTENTION_BACKEND:=}"      # dflash2 only: empty = engine default; the published DFlash2 profile pins FLASH_ATTN
+: "${MTP_MOE_BACKEND:=b12x}"            # mtp draft MoE: b12x (published Spark TP2 preset; Luke's GB10 launcher) | marlin (published TP4 profile default) | humming (JJ default; not shipped in the published KK images) | auto
+: "${MTP_ATTENTION_BACKEND:=B12X}"
 : "${BLOCK_SIZE:=256}"                 # paged-KV block; Luke's TP2 launcher uses 16 on the packed-cache (r22) tree
 : "${LIMIT_MM:=1}"                     # 1 = pass --limit-mm-per-prompt from MM_IMAGES/MM_VIDEOS; 0 = omit it (engine default: 999 per modality, bounded only by MAX_MODEL_LEN)
 : "${MM_PROCESSOR_CACHE_GB:=}"         # empty = engine default (4 GiB of host RAM = unified memory on Spark); 0 disables
@@ -358,7 +375,7 @@ require_unit_fraction() {
 : "${TRUST_REMOTE_CODE:=0}"
 : "${CONTAINER_RUNTIME:=docker}"
 : "${CONTAINER_NAME_SUFFIX:=}"
-: "${SERVING_IMAGE:=local/vllm:glm53-jovian-judgement-b12x-cu132-sm121}"
+: "${SERVING_IMAGE:=local/vllm:karmic-kraken-r1-cu133}"
 : "${SHM_SIZE:=16g}"
 
 # Accept MTP=<n> as an alias for NUM_SPECULATIVE_TOKENS under SPECULATOR=mtp,
@@ -391,9 +408,16 @@ fi
 require_positive_integer PREFILL_SCHEDULE_INTERVAL
 case "$COMPILATION_LEVEL" in ""|0|1|2|3) : ;; *) die "COMPILATION_LEVEL must be empty or 0-3: $COMPILATION_LEVEL" ;; esac
 case "$GENERATION_CONFIG" in auto|vllm) : ;; *) die "GENERATION_CONFIG must be auto or vllm: $GENERATION_CONFIG" ;; esac
-case "$KDA_PREFILL_BACKEND" in ""|auto|triton|flashkda|b12x) : ;; *) die "KDA_PREFILL_BACKEND must be empty, auto, triton, flashkda, or b12x: $KDA_PREFILL_BACKEND" ;; esac
+case "$KDA_PREFILL_BACKEND" in ""|auto|triton|flashkda|flashinfer|b12x) : ;; *) die "KDA_PREFILL_BACKEND must be empty, auto, triton, flashkda, flashinfer, or b12x: $KDA_PREFILL_BACKEND" ;; esac
+case "$KDA_DECODE_BACKEND" in ""|auto|native|flashinfer|triton) : ;; *) die "KDA_DECODE_BACKEND must be empty, auto, native, flashinfer, or triton: $KDA_DECODE_BACKEND" ;; esac
 case "$GDN_DECODE_KERNEL" in ""|b12x|cuda|triton) : ;; *) die "GDN_DECODE_KERNEL must be empty, b12x, cuda, or triton: $GDN_DECODE_KERNEL" ;; esac
-case "$FAIRNESS_ENGINE" in ""|compute_share|micro_slicing) : ;; *) die "FAIRNESS_ENGINE must be empty, compute_share, or micro_slicing: $FAIRNESS_ENGINE" ;; esac
+[ -z "$FAIRNESS_ENGINE" ] || die "FAIRNESS_ENGINE=$FAIRNESS_ENGINE: --fairness-engine no longer exists on karmic-kraken; remove it and set PREFILL_COMPUTE_SHARE alone (with PREFILL_SCHEDULE_INTERVAL=1)"
+case "$DRAFT_SAMPLE_METHOD" in greedy|probabilistic) : ;; *) die "DRAFT_SAMPLE_METHOD must be greedy or probabilistic: $DRAFT_SAMPLE_METHOD" ;; esac
+case "$REJECTION_SAMPLE_METHOD" in standard|block|synthetic) : ;; *) die "REJECTION_SAMPLE_METHOD must be standard, block, or synthetic: $REJECTION_SAMPLE_METHOD" ;; esac
+case "$MTP_MOE_BACKEND" in b12x|marlin|humming|auto) : ;; *) die "MTP_MOE_BACKEND must be b12x, marlin, humming, or auto: $MTP_MOE_BACKEND" ;; esac
+case "$MTP_ATTENTION_BACKEND" in B12X|auto) : ;; *) die "MTP_ATTENTION_BACKEND must be B12X or auto: $MTP_ATTENTION_BACKEND" ;; esac
+case "$DFLASH_ATTENTION_BACKEND" in ""|FLASH_ATTN|B12X|auto) : ;; *) die "DFLASH_ATTENTION_BACKEND must be empty, FLASH_ATTN, B12X, or auto: $DFLASH_ATTENTION_BACKEND" ;; esac
+case "$MAX_PARALLEL_PREFILLS" in ""|auto) : ;; *) require_positive_integer MAX_PARALLEL_PREFILLS ;; esac
 case "$LOAD_FORMAT" in
   instanttensor|fastsafetensors|auto|safetensors) : ;;
   b12x)
@@ -411,9 +435,20 @@ case "$REASONING_EFFORT" in ""|low|high|max) : ;; *) die "REASONING_EFFORT must 
 case "$CLEAR_THINKING" in ""|0|1) : ;; *) die "CLEAR_THINKING must be empty, 0, or 1: $CLEAR_THINKING" ;; esac
 case "$RECURRENT_CHECKPOINT_POLICY" in ""|auto|request_boundaries|aligned) : ;; *) die "RECURRENT_CHECKPOINT_POLICY must be empty, auto, request_boundaries, or aligned: $RECURRENT_CHECKPOINT_POLICY" ;; esac
 if [ -n "$PREFILL_COMPUTE_SHARE" ]; then
-  [ "$FAIRNESS_ENGINE" = compute_share ] || die "PREFILL_COMPUTE_SHARE requires FAIRNESS_ENGINE=compute_share"
-  awk -v v="$PREFILL_COMPUTE_SHARE" 'BEGIN{ exit !(v+0 > 0 && v+0 < 1 && v ~ /^[0-9]*\.?[0-9]+$/) }' \
-    || die "PREFILL_COMPUTE_SHARE must be a fraction in (0,1): $PREFILL_COMPUTE_SHARE"
+  # KK SchedulerConfig: prefill_compute_share is a fraction in (0,1) or "auto",
+  # and "cannot be combined with prefill_schedule_interval greater than one"
+  # (vllm/config/scheduler.py). The half-life is auto-mode only.
+  [ "$PREFILL_COMPUTE_SHARE" = auto ] \
+    || awk -v v="$PREFILL_COMPUTE_SHARE" 'BEGIN{ exit !(v+0 > 0 && v+0 < 1 && v ~ /^[0-9]*\.?[0-9]+$/) }' \
+    || die "PREFILL_COMPUTE_SHARE must be auto or a fraction in (0,1): $PREFILL_COMPUTE_SHARE"
+  [ "$PREFILL_SCHEDULE_INTERVAL" = 1 ] \
+    || die "PREFILL_COMPUTE_SHARE=$PREFILL_COMPUTE_SHARE requires PREFILL_SCHEDULE_INTERVAL=1 (the engine rejects share + interval > 1; the published GLM profile runs 0.4 / 1)"
+  if [ -n "$PREFILL_COMPUTE_HALF_LIFE" ]; then
+    [ "$PREFILL_COMPUTE_SHARE" = auto ] || die "PREFILL_COMPUTE_HALF_LIFE is only valid with PREFILL_COMPUTE_SHARE=auto"
+    case "$PREFILL_COMPUTE_HALF_LIFE" in smooth|responsive) : ;; *) awk -v v="$PREFILL_COMPUTE_HALF_LIFE" 'BEGIN{ exit !(v+0 > 0 && v ~ /^[0-9]*\.?[0-9]+$/) }' || die "PREFILL_COMPUTE_HALF_LIFE must be smooth, responsive, or seconds > 0: $PREFILL_COMPUTE_HALF_LIFE" ;; esac
+  fi
+elif [ -n "$PREFILL_COMPUTE_HALF_LIFE" ]; then
+  die "PREFILL_COMPUTE_HALF_LIFE requires PREFILL_COMPUTE_SHARE=auto"
 fi
 require_positive_integer BLOCK_SIZE
 case "$MM_PROCESSOR_CACHE_GB" in ""|[0-9]*) : ;; *) die "MM_PROCESSOR_CACHE_GB must be a number: $MM_PROCESSOR_CACHE_GB" ;; esac
@@ -481,7 +516,13 @@ done
 case "$NUM_SPECULATIVE_TOKENS" in
   ''|*[!0-9]*) die "NUM_SPECULATIVE_TOKENS must be a non-negative integer: $NUM_SPECULATIVE_TOKENS" ;;
 esac
-if [ "$MAX_MODEL_LEN" != auto ]; then
+if [ "$MAX_MODEL_LEN" = -1 ]; then
+  # KK: -1 = auto-fit the context to the KV pool (ModelConfig.max_model_len ge=-1;
+  # the published Spark preset runs -1 with an explicit KV_CACHE_MEMORY_BYTES).
+  [ -n "$KV_CACHE_MEMORY_BYTES" ] \
+    || die "MAX_MODEL_LEN=-1 (auto-fit) needs KV_CACHE_MEMORY_BYTES pinned; with profiling it auto-fits to whatever GPU_MEMORY_UTILIZATION leaves, which is not a reproducible contract"
+  warn "MAX_MODEL_LEN=-1: the engine fits the context ceiling to the KV pin at startup; read the reported capacity from the boot log and pin an explicit value once qualified"
+elif [ "$MAX_MODEL_LEN" != auto ]; then
   require_positive_integer MAX_MODEL_LEN
 else
   warn "MAX_MODEL_LEN=auto resolves to the checkpoint maximum (1M for GLM-5.3); on a Spark pair the 1M profile can starve the KV pool and auto-fit the context below the attention page size -- set an explicit value (qualified: 262144)"
@@ -795,7 +836,9 @@ esac
 [ -z "$COMPILATION_LEVEL" ] || extra_args+=("-O$COMPILATION_LEVEL")
 [ -z "$KDA_PREFILL_BACKEND" ] || extra_args+=(--kda-prefill-backend "$KDA_PREFILL_BACKEND")
 [ -z "$GDN_DECODE_KERNEL" ] || extra_args+=(--gdn-decode-kernel "$GDN_DECODE_KERNEL")
-[ -z "$FAIRNESS_ENGINE" ] || extra_args+=(--fairness-engine "$FAIRNESS_ENGINE")
+[ -z "$KDA_DECODE_BACKEND" ] || extra_args+=(--kda-decode-backend "$KDA_DECODE_BACKEND")
+[ -z "$PREFILL_COMPUTE_HALF_LIFE" ] || extra_args+=(--prefill-compute-half-life "$PREFILL_COMPUTE_HALF_LIFE")
+[ -z "$MAX_PARALLEL_PREFILLS" ] || extra_args+=(--max-parallel-prefills "$MAX_PARALLEL_PREFILLS")
 [ -z "$RECURRENT_CHECKPOINT_POLICY" ] || extra_args+=(--recurrent-checkpoint-policy "$RECURRENT_CHECKPOINT_POLICY")
 # Sampling and chat-template defaults are built HERE (JSON in a sourced env
 # file loses its quotes). Per-request fields still override them.
@@ -858,16 +901,20 @@ speculative_args=()
 if [ "$SPECULATOR" != none ] && [ "$NUM_SPECULATIVE_TOKENS" -gt 0 ]; then
   case "$SPECULATOR" in
     mtp)
-      # The MTP head is BF16 in this checkpoint; humming carries its MoE and
-      # B12X its attention, per the canonical GLM-5.3 recipe.
+      # The MTP head is BF16 in this checkpoint. karmic-kraken: b12x carries
+      # its MoE and B12X its attention (published Spark TP2 preset); the
+      # proposal head format is VLLM_GLM53_MTP_DRAFT_HEAD (env file).
+      # draft_sample_method defaults to greedy in the engine; the published
+      # GLM contract is probabilistic + standard rejection, so both are
+      # emitted explicitly.
       adaptive_fields=
       if [ "$ADAPTIVE_SPECULATIVE_TOKENS" = 1 ]; then
         adaptive_fields=$(printf ',"adaptive_speculative_tokens_window":%s,"adaptive_speculative_tokens_initial":%s' \
           "$ADAPTIVE_SPECULATIVE_TOKENS_WINDOW" "$ADAPTIVE_SPECULATIVE_TOKENS_INITIAL")
       fi
       speculative_config=$(printf \
-        '{"method":"mtp","num_speculative_tokens":%s,"moe_backend":"%s","attention_backend":"%s"%s}' \
-        "$NUM_SPECULATIVE_TOKENS" "${MTP_MOE_BACKEND:-humming}" "${MTP_ATTENTION_BACKEND:-B12X}" "$adaptive_fields")
+        '{"method":"mtp","num_speculative_tokens":%s,"draft_sample_method":"%s","rejection_sample_method":"%s","moe_backend":"%s","attention_backend":"%s"%s}' \
+        "$NUM_SPECULATIVE_TOKENS" "$DRAFT_SAMPLE_METHOD" "$REJECTION_SAMPLE_METHOD" "$MTP_MOE_BACKEND" "$MTP_ATTENTION_BACKEND" "$adaptive_fields")
       ;;
     dflash2)
       # Works for both draft checkpoints: BF16 (incoai/GLM-5.3-Flash-DFlash2)
@@ -875,9 +922,11 @@ if [ "$SPECULATOR" != none ] && [ "$NUM_SPECULATIVE_TOKENS" -gt 0 ]; then
       # quantization is read from the checkpoint config; point
       # DFLASH_MODEL_HOST_PATH at whichever is downloaded. kv_cache_dtype
       # auto (BF16) is the qualified value for both.
+      dflash_attention_json=
+      [ -z "$DFLASH_ATTENTION_BACKEND" ] || dflash_attention_json=$(printf ',"attention_backend":"%s"' "$DFLASH_ATTENTION_BACKEND")
       speculative_config=$(printf \
-        '{"method":"dflash","model":"%s","num_speculative_tokens":%s,"kv_cache_dtype":"%s"}' \
-        "$dflash_container_path" "$NUM_SPECULATIVE_TOKENS" "$DFLASH_KV_CACHE_DTYPE")
+        '{"method":"dflash","model":"%s","num_speculative_tokens":%s,"kv_cache_dtype":"%s","draft_sample_method":"%s","rejection_sample_method":"%s"%s}' \
+        "$dflash_container_path" "$NUM_SPECULATIVE_TOKENS" "$DFLASH_KV_CACHE_DTYPE" "$DRAFT_SAMPLE_METHOD" "$REJECTION_SAMPLE_METHOD" "$dflash_attention_json")
       ;;
   esac
   speculative_args=(--speculative-config "$speculative_config")
@@ -1009,8 +1058,13 @@ printf '  cache:                   %s\n' "$CACHE_HOST_PATH"
 printf '  MAX_MODEL_LEN:           %s\n' "$MAX_MODEL_LEN"
 printf '  MAX_NUM_SEQS:            %s\n' "$MAX_NUM_SEQS"
 printf '  MAX_NUM_BATCHED_TOKENS:  %s\n' "$MAX_NUM_BATCHED_TOKENS"
-printf '  SPECULATOR:              %s (%s draft tokens)\n' \
-  "$SPECULATOR" "$NUM_SPECULATIVE_TOKENS"
+printf '  SPECULATOR:              %s (%s draft tokens, %s draft sampling, %s rejection)\n' \
+  "$SPECULATOR" "$NUM_SPECULATIVE_TOKENS" "$DRAFT_SAMPLE_METHOD" "$REJECTION_SAMPLE_METHOD"
+if [ -n "$PREFILL_COMPUTE_SHARE" ]; then
+  printf '  PREFILL:                 compute share %s, interval %s%s\n' "$PREFILL_COMPUTE_SHARE" "$PREFILL_SCHEDULE_INTERVAL" "${MAX_PARALLEL_PREFILLS:+, max parallel $MAX_PARALLEL_PREFILLS}"
+else
+  printf '  PREFILL:                 schedule interval %s%s\n' "$PREFILL_SCHEDULE_INTERVAL" "${MAX_PARALLEL_PREFILLS:+, max parallel $MAX_PARALLEL_PREFILLS}"
+fi
 printf '  KV_CACHE_MEMORY_BYTES:   %s (%s)\n' \
   "${KV_CACHE_MEMORY_BYTES:-profiled at $GPU_MEMORY_UTILIZATION}" "$KV_CACHE_DTYPE"
 if [ -n "$KV_CACHE_MEMORY_BYTES" ]; then
