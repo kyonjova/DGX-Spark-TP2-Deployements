@@ -333,7 +333,7 @@ require_unit_fraction() {
 # (lil.yaml + Luke's launcher), not pair measurements.
 
 : "${SERVED_MODEL_NAME:=XiaomiMiMo/MiMo-V2.6-Flash-RL}"
-: "${SPECULATOR:=none}"                # none (catalog-qualified) | mtp (in-checkpoint head, first A/B); dflash = deferred (pro-lineage, needs a draft snapshot)
+: "${SPECULATOR:=none}"                # none | mtp (3 in-checkpoint MTP layers) | dflash (the dflash/ draft shipped in the Flash-RL snapshot: 5 SWA layers, block 8)
 : "${GPU_MEMORY_UTILIZATION:=0.90}"   # pair default; GB10 cu132 ceiling ~0.913; catalog's 0.98 is the RTX TP4 value
 : "${KV_CACHE_MEMORY_BYTES:=}"         # empty = let vLLM profile and choose (MiMo pool math never measured anywhere)
 : "${KV_CACHE_DTYPE:=bfloat16}"        # catalog-qualified for MiMo's 192-dim attention; fp8 UNVERIFIED on this model (A/B later)
@@ -396,10 +396,13 @@ if [ -n "${MTP-}" ] && [ -z "${NUM_SPECULATIVE_TOKENS-}" ]; then
   NUM_SPECULATIVE_TOKENS=$MTP
 fi
 
+: "${DFLASH_SUBDIR:=dflash}"            # draft location inside MODEL_HOST_PATH (the HF snapshot ships dflash/)
+: "${DFLASH_KV_CACHE_DTYPE:=auto}"      # KK serve-mimo26-pro.sh: draft KV "auto" (BF16)
 case "$SPECULATOR" in
   none)    : "${NUM_SPECULATIVE_TOKENS:=0}" ;;
-  mtp)     : "${NUM_SPECULATIVE_TOKENS:=3}" ;;   # in-checkpoint MTP head; depth A/B after first boot
-  *) die "SPECULATOR must be none or mtp: $SPECULATOR (dflash is deferred -- pro-lineage, needs a draft snapshot)" ;;
+  mtp)     : "${NUM_SPECULATIVE_TOKENS:=3}" ;;   # 3 = one trained MTP layer per step (num_nextn_predict_layers 3)
+  dflash)  : "${NUM_SPECULATIVE_TOKENS:=7}" ;;   # dflash/config.json block_size 8 -> 7 draft tokens (KK Pro launcher default 7)
+  *) die "SPECULATOR must be none, mtp, or dflash: $SPECULATOR" ;;
 esac
 
 [ -z "$PREFILL_SCHEDULE_INTERVAL" ] || require_positive_integer PREFILL_SCHEDULE_INTERVAL
@@ -496,6 +499,16 @@ done
 case "$NUM_SPECULATIVE_TOKENS" in
   ''|*[!0-9]*) die "NUM_SPECULATIVE_TOKENS must be a non-negative integer: $NUM_SPECULATIVE_TOKENS" ;;
 esac
+if [ "$SPECULATOR" = mtp ] && [ "$NUM_SPECULATIVE_TOKENS" -gt 3 ]; then
+  warn "SPECULATOR=mtp with $NUM_SPECULATIVE_TOKENS tokens: MiMo ships 3 MTP layers and steps past 3 reuse them cyclically (mimo_v2_mtp.py: spec_step_idx % num_mtp_layers) -- expect tail acceptance to fall off"
+fi
+if [ "$SPECULATOR" = dflash ]; then
+  [ -f "$MODEL_HOST_PATH/$DFLASH_SUBDIR/config.json" ] \
+    || die "SPECULATOR=dflash but $MODEL_HOST_PATH/$DFLASH_SUBDIR/config.json is missing -- download the snapshot's dflash/ folder (hf download ... --include 'dflash/*')"
+  [ "$NUM_SPECULATIVE_TOKENS" = 7 ] \
+    || warn "SPECULATOR=dflash with $NUM_SPECULATIVE_TOKENS tokens: the draft's block_size is 8 (7 draft tokens); other depths are unqualified"
+  case "$DFLASH_KV_CACHE_DTYPE" in auto|bfloat16|fp8) : ;; *) die "DFLASH_KV_CACHE_DTYPE must be auto, bfloat16, or fp8: $DFLASH_KV_CACHE_DTYPE" ;; esac
+fi
 if [ "$MAX_MODEL_LEN" = -1 ]; then
   # KK: -1 = auto-fit the context to the KV pool (ModelConfig.max_model_len ge=-1;
   # the published Spark preset runs -1 with an explicit KV_CACHE_MEMORY_BYTES).
@@ -512,8 +525,9 @@ case "$LANGUAGE_MODEL_ONLY" in
   0|1) : ;;
   *) die "LANGUAGE_MODEL_ONLY must be 0 or 1: $LANGUAGE_MODEL_ONLY" ;;
 esac
-[ "$LANGUAGE_MODEL_ONLY" = 1 ] \
-  || warn "LANGUAGE_MODEL_ONLY=0 profiles the vision encoder against a maximum-size video item and reserves the encoder cache; expect several GiB less KV"
+if [ "$LANGUAGE_MODEL_ONLY" = 0 ] && { [ "${LIMIT_MM:-1}" = 0 ] || [ "${MM_VIDEOS:-0}" -gt 0 ]; }; then
+  warn "video is enabled (LIMIT_MM=0 or MM_VIDEOS>0): the encoder is profiled against a maximum-size VIDEO item (first boot: 114,688-token encoder budget, 6.88 GiB peak activation); MM_VIDEOS=0 with LIMIT_MM=1 drops it"
+fi
 
 require_port API_PORT
 require_port MASTER_PORT
@@ -913,6 +927,12 @@ if [ "$SPECULATOR" != none ] && [ "$NUM_SPECULATIVE_TOKENS" -gt 0 ]; then
       # method + depth (no backend keys, no sampling keys -- the engine
       # default greedy applies; the catalog leaves speculators unqualified).
       speculative_config=$(printf '{"method":"mtp","num_speculative_tokens":%s}' "$NUM_SPECULATIVE_TOKENS")
+      ;;
+    dflash)
+      # KK serve-mimo26-pro.sh shape: separate draft snapshot, draft KV auto,
+      # B12X attention. The draft lives inside the read-only model mount.
+      speculative_config=$(printf '{"method":"dflash","model":"%s/%s","num_speculative_tokens":%s,"kv_cache_dtype":"%s","attention_backend":"B12X"}' \
+        "$model_container_path" "$DFLASH_SUBDIR" "$NUM_SPECULATIVE_TOKENS" "$DFLASH_KV_CACHE_DTYPE")
       ;;
   esac
   speculative_args=(--speculative-config "$speculative_config")
