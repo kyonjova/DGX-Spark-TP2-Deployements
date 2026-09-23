@@ -150,10 +150,12 @@ model_validate() {
   # at C8/C16 in three diagnostic sweeps; 1 restored it (W4A16, not W4A4).
   [ "$VLLM_LM_HEAD_A16" = 1 ] \
     || die "VLLM_LM_HEAD_A16=0 produced near-zero MTP draft acceptance at C8/C16 in three diagnostic sweeps; keep 1"
-  # Qwen keeps the TARGET head BF16 (doc); =1 is the GLM-5.3 value -- guard
-  # against copying glm53-rank.env.example lines.
+  # Qwen's qualified recipe keeps the TARGET head BF16 (doc). =1 (online
+  # MXFP8 target head, W8A16 with VLLM_LM_HEAD_A16=1) is Luke's 2026-09-23
+  # A/B candidate: allowed, but unqualified -- watch MTP acceptance and
+  # output quality against a =0 boot.
   [ "$VLLM_MXFP8_LM_HEAD" = 0 ] \
-    || die "VLLM_MXFP8_LM_HEAD=1 is the GLM-5.3 value; the qualified Qwen recipe keeps the target head BF16 (0) and quantizes only the private MTP copy"
+    || warn "VLLM_MXFP8_LM_HEAD=1: target head quantized to MXFP8 online (A/B candidate, not the qualified BF16 head); compare acceptance + quality against a =0 boot"
   [ "$VLLM_MTP_NVFP4_LM_HEAD" = 1 ] \
     || warn "VLLM_MTP_NVFP4_LM_HEAD=0 leaves the draft head unquantized; the qualified recipe runs 1"
   # Device-resident PLE: implemented, not qualified; the ~24 GiB n-gram table
@@ -552,6 +554,7 @@ model_defaults   # hook: model fallbacks
 : "${MM_VIDEOS:=0}"                          # per-PROMPT video cap; 0 drops the max-size video profile item
 : "${MM_PROCESSOR_CACHE_GB:=}"               # host-RAM cache of preprocessed media; on unified memory this is KV memory. 0 disables
 : "${MM_ENCODER_TP_MODE:=}"                  # data = each rank encodes its own items (no encoder collectives) | weights = engine default
+: "${FUSE_ACT_QUANT:=}"                      # 1/0 = pin pass_config.fuse_act_quant; empty = engine default (already ON for NVFP4 + custom_ops all)
 : "${COMPILATION_LEVEL:=}"                   # 0-3 = -O<N> torch.compile level; empty = engine default. A/B only
 : "${GENERATION_CONFIG:=auto}"               # auto = checkpoint's generation_config.json; vllm = engine defaults
 : "${CHAT_TEMPLATE_HOST_PATH:=}"             # optional .jinja mounted read-only and passed as --chat-template
@@ -648,6 +651,7 @@ fi
 case "$MEM_PREFLIGHT" in die|warn|off) : ;; *) die "MEM_PREFLIGHT must be die, warn, or off: $MEM_PREFLIGHT" ;; esac
 case "$FABRIC_PROFILE" in single|dual) : ;; *) die "FABRIC_PROFILE must be single or dual: $FABRIC_PROFILE" ;; esac
 case "$GENERATION_CONFIG" in auto|vllm) : ;; *) die "GENERATION_CONFIG must be auto or vllm: $GENERATION_CONFIG" ;; esac
+case "$FUSE_ACT_QUANT" in ""|0|1) : ;; *) die "FUSE_ACT_QUANT must be empty, 0, or 1: $FUSE_ACT_QUANT" ;; esac
 case "$COMPILATION_LEVEL" in ""|0|1|2|3) : ;; *) die "COMPILATION_LEVEL must be empty or 0-3: $COMPILATION_LEVEL" ;; esac
 case "$INSTANTTENSOR_COPY" in
   auto) ;;
@@ -979,7 +983,12 @@ if [ "$SPECULATOR" != none ] && [ "$NUM_SPECULATIVE_TOKENS" -gt 0 ]; then
   speculative_args=(--speculative-config "$(model_speculative_config)")   # hook
 fi
 
-compilation_config=$(printf '{"cudagraph_mode":"%s","custom_ops":["all"]}' "$CUDAGRAPH_MODE")
+pass_config_json=""
+case "$FUSE_ACT_QUANT" in
+  1) pass_config_json=',"pass_config":{"fuse_act_quant":true}' ;;
+  0) pass_config_json=',"pass_config":{"fuse_act_quant":false}' ;;
+esac
+compilation_config=$(printf '{"cudagraph_mode":"%s","custom_ops":["all"]%s}' "$CUDAGRAPH_MODE" "$pass_config_json")
 
 # Optional serve flags. Each is omitted unless configured, because an unknown
 # CLI flag is a hard argparse failure at exec on an image that predates it.
@@ -1193,6 +1202,8 @@ fi
 printf '  RoCEnante:               %s\n' \
   "$([ "${VLLM_ENABLE_ROCE_ALLREDUCE:-0}" = 1 ] && echo "on (<= ${VLLM_ROCE_ALLREDUCE_MAX_SIZE:-default} B)" || echo 'off (NCCL for all collectives)')"
 printf '  CUDAGRAPH_MODE:          %s (capture %s)\n' "$CUDAGRAPH_MODE" "$MAX_CUDAGRAPH_CAPTURE_SIZE"
+printf '  compilation-config:      %s\n' "$compilation_config"
+printf '  target LM head:          %s\n' "$([ "$VLLM_MXFP8_LM_HEAD" = 1 ] && echo 'MXFP8 online (A/B)' || echo 'BF16 (qualified)')"
 printf '  LOAD_FORMAT:             %s\n' "$LOAD_FORMAT"
 printf '  fabric profile:          %s-rail (%s)\n' "$FABRIC_PROFILE" "$NCCL_IB_HCA"
 [ "${#extra_args[@]}" -eq 0 ] || printf '  optional flags:          %s\n' "${extra_args[*]}"
