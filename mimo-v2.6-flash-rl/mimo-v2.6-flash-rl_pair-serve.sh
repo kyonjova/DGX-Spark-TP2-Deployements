@@ -1,39 +1,44 @@
 #!/usr/bin/env bash
-# glm53_pair_serve.sh
+# mimo-v2.6-flash-rl_pair_serve.sh
 #
-# Validate or start one rank of a two-node DGX Spark pair serving
-# GLM-5.3-Flash-NVFP4 under vLLM (karmic-kraken, formerly dev/jovian-judgement,
-# + B12X/SparkInfer), with either the built-in MTP head or the DFlash2 draft
-# model as speculator.
+# Validate or start one rank of a two-node DGX Spark pair (TP=2 over the
+# direct ConnectX-7 RoCE link) serving XiaomiMiMo/MiMo-V2.6-Flash-RL under
+# vLLM (karmic-kraken @ 57fdda71 + b12x @ 8a99d639 -- the kk-beta-cu132
+# profile). Model: MiMoV2ForCausalLM -- 48 layers, hidden 4096, head_dim 192
+# full attention alternating with SWA layers (hybrid_layer_pattern), MXFP4
+# routed experts + block-FP8 projections, image/video encoders, audio via the
+# MiMoV2OmniForCausalLM override (HF_OVERRIDES knob; not the groundwork
+# default). NO mamba/GDN/recurrent state: pure-attention hybrid.
 #
-# karmic-kraken (2026-09-20, vllm 57a8098 / b12x e9ce547): --fairness-engine is
-# gone (--prefill-compute-share stands alone and forbids an interval > 1),
-# the MTP draft MoE default is b12x, the qualified MTP contract is
-# probabilistic proposals + standard rejection, --max-model-len -1 auto-fits
-# to the KV pin, and --kda-decode-backend / --max-parallel-prefills /
-# --prefill-compute-half-life are new. Older pins reject the new flags; every
-# one of them is emitted only when its variable is set.
+# kk-beta-cu132 (2026-09-23): the b12x loader is REQUIRED for this checkpoint
+# (MiMo checkpoint + auxiliary-state loading lives in it -- de16d74135,
+# 308fb7204f; the catalog's load_format: b12x). The loader reads weights
+# through an O_DIRECT io_uring ring (b12x 1ec67ef6), which needs
+# io_uring_setup/enter/register in the container seccomp: this launcher ships
+# seccomp-io-uring.json (Moby default + the three syscalls, from vLLM
+# scripts/seccomp/spark-io-uring.json) and probes io_uring inside the image
+# at --check, dying with an actionable message if blocked.
 #
-# The per-rank env file is both the host launch contract and the container
-# environment, so operator-facing paths and serving values have one source of
-# truth. Every value is validated before a container is started: unresolved
-# placeholders, CRLF line endings, missing model bytes, occupied ports, a
-# VLLM_HOST_IP that is not local, LD_PRELOAD paths absent from the image, and
-# known-bad combinations all fail at --check time rather than minutes into a
-# boot.
+# GROUNDWORK STATUS: the catalog qualifies MiMo at TP4 on SM120 (sm_120a)
+# ONLY; GB10/sm_121a is unqualified territory -- expect kernel surprises and
+# treat every value below as the vendor contract (lil.yaml + Luke's
+# serve-mimo26-flash.sh), not a measured one. Speculation: none (qualified);
+# the in-checkpoint MTP head is the first A/B. Set max_model_len 262144 for
+# the first boots; the checkpoint's 1,048,576 ceiling is the post-bring-up
+# target.
 #
 # Usage:
-#     ./glm53_pair_serve.sh --check   rank-0.env
-#     ./glm53_pair_serve.sh --run     rank-0.env
-#     ./glm53_pair_serve.sh --restart rank-0.env
-#     ./glm53_pair_serve.sh --logs    rank-0.env
-#     ./glm53_pair_serve.sh --status  rank-0.env
-#     ./glm53_pair_serve.sh --down    rank-0.env
-#     ./glm53_pair_serve.sh --clear   rank-0.env
-#     ./glm53_pair_serve.sh --fresh   rank-0.env # drop page cache, then --run, then follow logs
+#     ./mimo-v2.6-flash-rl_pair_serve.sh --check   rank-0.env
+#     ./mimo-v2.6-flash-rl_pair_serve.sh --run     rank-0.env
+#     ./mimo-v2.6-flash-rl_pair_serve.sh --restart rank-0.env
+#     ./mimo-v2.6-flash-rl_pair_serve.sh --down    rank-0.env
+#     ./mimo-v2.6-flash-rl_pair_serve.sh --logs    rank-0.env
+#     ./mimo-v2.6-flash-rl_pair_serve.sh --verify  rank-0.env
+#     ./mimo-v2.6-flash-rl_pair_serve.sh --status  rank-0.env
+#     ./mimo-v2.6-flash-rl_pair_serve.sh --clear   rank-0.env
+#     ./mimo-v2.6-flash-rl_pair_serve.sh --fresh   rank-0.env
 #
-# Anything after ENV_FILE is appended verbatim to the vllm serve argv:
-#     ./glm53_pair_serve.sh --run rank-0.env --logprobs-mode processed_logprobs
+# Anything after ENV_FILE is appended verbatim to the vllm serve argv.
 #
 # Start rank 1 (headless, waits for rank 0) before rank 0.
 
@@ -41,7 +46,7 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-usage: glm53_pair_serve.sh [MODE] ENV_FILE [extra vllm args...]
+usage: mimo-v2.6-flash-rl_pair_serve.sh [MODE] ENV_FILE [extra vllm args...]
 
   --check     validate the env file and print the launch command (default)
   --run       validate, then start the container detached
@@ -56,12 +61,12 @@ EOF
 }
 
 die() {
-  echo "glm53 pair launcher: $*" >&2
+  echo "mimo pair launcher: $*" >&2
   exit 20
 }
 
 warn() {
-  echo "glm53 pair launcher: warning: $*" >&2
+  echo "mimo pair launcher: warning: $*" >&2
 }
 
 # Reclaim page cache: on GB10 CUDA free memory tracks MemFree, so page cache
@@ -133,12 +138,29 @@ fi
 # shellcheck disable=SC1090
 . "$env_file"
 
+# --env-file delivers KEY= as an EMPTY STRING, never as "unset". The
+# launcher's own keys treat empty as "omit the flag"; engine-read variables
+# do not (VLLM_PREFIX_CACHE_RETENTION_INTERVAL= crashed argparse with int('')
+# on 2026-09-11). Refuse an empty value for any key the launcher does not
+# consume. Models extend the allow-list via MODEL_EMPTY_OK_KEYS
+# (space-separated).
+LAUNCHER_EMPTY_OK_KEYS="API_KEY NUM_SPECULATIVE_TOKENS KV_CACHE_MEMORY_BYTES CONTAINER_MEMORY_GB CONTAINER_NAME_SUFFIX PREFILL_SCHEDULE_INTERVAL FAIRNESS_ENGINE PREFILL_COMPUTE_SHARE PREFILL_COMPUTE_HALF_LIFE MAX_PARALLEL_PREFILLS SECCOMP_PROFILE VLLM_KV_CACHE_LAYOUT CUSTOM_OPS ASYNC_SCHEDULING PREFIX_RETENTION_INTERVAL COMPILATION_LEVEL SAMPLING_TEMPERATURE SAMPLING_TOP_P SAMPLING_TOP_K SAMPLING_MIN_P SAMPLING_REPETITION_PENALTY MM_PROCESSOR_CACHE_GB MM_ENCODER_TP_MODE CHAT_TEMPLATE_HOST_PATH TORCH_PROFILE_HOST_DIR VLLM_PLUGINS"
+MODEL_EMPTY_OK_KEYS="B12X_AUTOTUNE"
+empty_bad=""
+for k in $(grep -Eo '^[[:space:]]*[A-Z][A-Z0-9_]*=[[:space:]]*$' "$env_file" | tr -d ' ='); do
+  case " ${LAUNCHER_EMPTY_OK_KEYS} ${MODEL_EMPTY_OK_KEYS:-} " in
+    *" $k "*) ;;
+    *) empty_bad="$empty_bad $k" ;;
+  esac
+done
+[ -z "$empty_bad" ] || die "empty value(s) not allowed for engine-read key(s):$empty_bad -- delete the line instead (empty is a VALUE, not unset)"
+
 # ------------------------------------------------- container management modes
 # These need only the rank and runtime, so they run before full validation.
 
 : "${CONTAINER_RUNTIME:=docker}"
 : "${CONTAINER_NAME_SUFFIX:=}"
-mgmt_container="glm53-flash-r${NODE_RANK:-?}${CONTAINER_NAME_SUFFIX}"
+mgmt_container="mimo-v26-flash-r${NODE_RANK:-?}${CONTAINER_NAME_SUFFIX}"
 
 require_runtime() {
   command -v "$CONTAINER_RUNTIME" >/dev/null 2>&1 \
@@ -176,8 +198,6 @@ container_clear() {
     || die "refusing to clear a shallow path (needs 4+ levels): $target"
   [ "$target" != "${MODEL_HOST_PATH-}" ] \
     || die "CACHE_HOST_PATH equals MODEL_HOST_PATH; refusing to clear: $target"
-  [ "$target" != "${DFLASH_MODEL_HOST_PATH-}" ] \
-    || die "CACHE_HOST_PATH equals DFLASH_MODEL_HOST_PATH; refusing to clear: $target"
 
   require_runtime
   if "$CONTAINER_RUNTIME" container inspect "$mgmt_container" >/dev/null 2>&1; then
@@ -221,11 +241,11 @@ case "$mode" in
     ;;
   --verify)
     require_runtime
-    # Marker set from the rtx6kpro r7 runbook's "Verify startup" section, plus
-    # the page-split and KV lines that matter on the pair. Absence of a marker
-    # you expect (e.g. B12xMxfp8 under dflash2) means the wrong path was taken.
+    # Markers that matter on the pair: the MiMo model class, the b12x
+    # attention/linear/MoE lines, the KV/cudagraph lines. Absence of a marker
+    # you expect means the wrong path was taken.
     "$CONTAINER_RUNTIME" logs "$mgmt_container" 2>&1 | grep -E \
-      'speculative_config|Using .* all-reduce backends|RoCEnante|B12X_ROCENANTE|kda_prefill|KDA prefill|B12xMxfp8|HUMMING|Humming|FlashAttention version 2|FlashKDA|split GLM-5.3 cache pages|DFlash draft KV layers|physical page sizes|Add [0-9]+ padding layers|attention block size|Available KV cache memory|GPU KV cache size|Graph capturing finished|cudagraph_mode=|Application startup complete' \
+      'speculative_config|MiMo|Mimo|b12x|B12X|B12x|indexer|Indexer|BLHNC|Loading (safetensors|weights)|Using .* all-reduce backends|RoCEnante|attention block size|Available KV cache memory|GPU KV cache size|Maximum concurrency|Graph capturing finished|cudagraph_mode=|Application startup complete' \
       | sed 's/^/  /'
     if [ "${NODE_RANK:-}" = 0 ]; then
       printf 'health: '; curl -fsS "http://127.0.0.1:${API_PORT:-8000}/health" 2>/dev/null && echo " OK" || echo " not ready"
@@ -304,78 +324,66 @@ require_unit_fraction() {
 
 # ------------------------------------------------------- serving defaults
 # Every value below may be set in the env file; these are the fallbacks.
-# Serving flags mirror serve-glm53-flash-nvfp4.sh from dev/jovian-judgement --
-# the canonical single-node recipe for this checkpoint -- with the two-node
-# topology and DGX Spark fabric handling carried over from the validated
-# DeepSeek pair launcher.
+# Serving flags mirror serve-mimo26-flash.sh (Luke's canonical MiMo recipe at
+# the pin) -- with the two-node topology and DGX Spark fabric handling carried
+# over from the validated GLM pair launcher. Values are the VENDOR CONTRACT
+# (lil.yaml + Luke's launcher), not pair measurements.
 
-: "${SERVED_MODEL_NAME:=zai-org/GLM-5.3-Flash}"
-: "${SPECULATOR:=mtp}"                 # mtp | dflash2 | none
-: "${GPU_MEMORY_UTILIZATION:=0.90}"   # measured stable through profiling on the pair; GB10 ceiling ~0.913
-: "${KV_CACHE_MEMORY_BYTES:=}"         # empty = let vLLM profile and choose
-: "${KV_CACHE_DTYPE:=fp8}"
-: "${DFLASH_KV_CACHE_DTYPE:=auto}"     # draft KV; auto (BF16) is the qualified value
+: "${SERVED_MODEL_NAME:=XiaomiMiMo/MiMo-V2.6-Flash-RL}"
+: "${SPECULATOR:=none}"                # none (catalog-qualified) | mtp (in-checkpoint head, first A/B); dflash = deferred (pro-lineage, needs a draft snapshot)
+: "${GPU_MEMORY_UTILIZATION:=0.90}"   # pair default; GB10 cu132 ceiling ~0.913; catalog's 0.98 is the RTX TP4 value
+: "${KV_CACHE_MEMORY_BYTES:=}"         # empty = let vLLM profile and choose (MiMo pool math never measured anywhere)
+: "${KV_CACHE_DTYPE:=bfloat16}"        # catalog-qualified for MiMo's 192-dim attention; fp8 UNVERIFIED on this model (A/B later)
 : "${QUANTIZATION:=modelopt_mixed}"    # `auto` omits the flag (checkpoint self-describes)
-: "${PREFILL_SCHEDULE_INTERVAL:=8}"    # admit new prefill every N engine steps; inert before #546 (r8), then stops decode starvation
+: "${PREFILL_SCHEDULE_INTERVAL:=}"     # empty = engine default; the GLM pair's 8 is an unmeasured import here
 : "${COMPILATION_LEVEL:=}"             # empty = no -O flag; 0-3 passes -O<N> (torch.compile level) -- A/B only
-: "${GENERATION_CONFIG:=auto}"         # auto = model's generation_config.json; vllm = engine defaults
-: "${SAMPLING_TEMPERATURE:=}"          # empty = checkpoint/engine default; r30 GLM launcher supplies 1.0 (publisher generation_config)
-: "${SAMPLING_TOP_P:=}"                # empty = default; r30 supplies 0.95; fixed top-k stays off (GLM does not inherit Qwen's 20)
-: "${SAMPLING_TOP_K:=}"                # empty = default (off); integer
-: "${SAMPLING_MIN_P:=}"                # empty = default (0)
-: "${SAMPLING_REPETITION_PENALTY:=}"   # empty = default (1.0)
-: "${REASONING_EFFORT:=}"              # empty = template default; low|high|max via --default-chat-template-kwargs (r30 default: high)
-: "${CLEAR_THINKING:=}"                # empty = template default; 0 keeps client-supplied historical reasoning in the prompt (r30 agent profile); 1 strips it
-: "${KDA_PREFILL_BACKEND:=}"           # empty = engine default; b12x|flashkda|triton|auto (needs vllm pin >= 54371894e, 2026-09-03)
-: "${GDN_DECODE_KERNEL:=}"             # empty = engine default; b12x|cuda|triton (explicit KDA decode kernel; Luke's TP2 launcher pins b12x)
-: "${FAIRNESS_ENGINE:=}"               # RETIRED on karmic-kraken (no --fairness-engine); must stay empty -- PREFILL_COMPUTE_SHARE stands alone
-: "${RECURRENT_CHECKPOINT_POLICY:=}"   # empty = engine default (auto); request_boundaries|aligned (vllm pin >= 52d9977b, 2026-09-05)
-: "${PREFILL_COMPUTE_SHARE:=}"         # empty = off; fraction in (0,1) or auto. Published GLM profile: 0.4 with PREFILL_SCHEDULE_INTERVAL=1 (KK rejects share + interval > 1)
-: "${PREFILL_COMPUTE_HALF_LIFE:=}"     # KK: only with PREFILL_COMPUTE_SHARE=auto; seconds, or smooth (2 s) | responsive (0.5 s)
-: "${MAX_PARALLEL_PREFILLS:=}"         # KK: empty = engine default (1); positive integer or auto. Published GLM profile: 1
-: "${KDA_DECODE_BACKEND:=}"            # KK: empty = engine default (auto); auto|native|flashinfer|triton (--kda-decode-backend; the published profile passes glm53_kda_decode_backend=auto)
-: "${DRAFT_SAMPLE_METHOD:=probabilistic}" # mtp/dflash2 draft sampling: probabilistic (published GLM contract; full draft logits in the ratio test, more GPU memory) | greedy (engine default, what JJ ran)
-: "${REJECTION_SAMPLE_METHOD:=standard}"  # standard (published) | block | synthetic
-: "${DFLASH_ATTENTION_BACKEND:=}"      # dflash2 only: empty = engine default; the published DFlash2 profile pins FLASH_ATTN
-: "${MTP_MOE_BACKEND:=b12x}"            # mtp draft MoE: b12x (published Spark TP2 preset; Luke's GB10 launcher) | marlin (published TP4 profile default) | humming (JJ default; not shipped in the published KK images) | auto
-: "${MTP_ATTENTION_BACKEND:=B12X}"
-: "${BLOCK_SIZE:=256}"                 # paged-KV block; Luke's TP2 launcher uses 16 on the packed-cache (r22) tree
-: "${LIMIT_MM:=1}"                     # 1 = pass --limit-mm-per-prompt from MM_IMAGES/MM_VIDEOS; 0 = omit it (engine default: 999 per modality, bounded only by MAX_MODEL_LEN)
-: "${MM_PROCESSOR_CACHE_GB:=}"         # empty = engine default (4 GiB of host RAM = unified memory on Spark); 0 disables
-: "${MM_ENCODER_TP_MODE:=}"            # empty = engine default; data = each rank encodes its own images (no encoder TP collectives)
-: "${CHAT_TEMPLATE_HOST_PATH:=}"       # optional custom .jinja (e.g. reasoning default high)
-: "${INSTANTTENSOR_COPY:=auto}"        # 0 = --model-loader-extra-config instanttensor_copy:false (bounded loading, needs 2026-08-29+ pin)
+: "${GENERATION_CONFIG:=vllm}"         # catalog: vllm (MiMo's generation_config is not authoritative); override-generation-config carries 1.0/0.95 (Luke's launcher)
+: "${SAMPLING_TEMPERATURE:=}"          # empty = launcher's override (1.0/0.95 below); per-request fields still win
+: "${SAMPLING_TOP_P:=}"
+: "${SAMPLING_TOP_K:=}"
+: "${SAMPLING_MIN_P:=}"
+: "${SAMPLING_REPETITION_PENALTY:=}"
+: "${FAIRNESS_ENGINE:=}"               # RETIRED on karmic-kraken (no --fairness-engine); must stay empty
+: "${PREFILL_COMPUTE_SHARE:=}"         # empty = off; fraction in (0,1) or auto; requires PREFILL_SCHEDULE_INTERVAL=1. The third-party attachment runs 0.8 (TP4) -- unmeasured here
+: "${PREFILL_COMPUTE_HALF_LIFE:=}"     # only with PREFILL_COMPUTE_SHARE=auto; seconds, or smooth (2 s) | responsive (0.5 s)
+: "${MAX_PARALLEL_PREFILLS:=}"         # empty = engine default (1); positive integer or auto
+: "${BLOCK_SIZE:=128}"                 # catalog-qualified geometry for MiMo's 192/128 attention (GLM's 256 is NOT this model's value)
+: "${LIMIT_MM:=1}"                     # 1 = pass --limit-mm-per-prompt from MM_IMAGES/MM_VIDEOS; 0 = omit it (engine default: 999 per modality)
+: "${MM_PROCESSOR_CACHE_GB:=0}"        # 0 disables (catalog multimodal: processor_cache_gb 0); on unified memory the 4 GiB default is KV pool
+: "${MM_ENCODER_TP_MODE:=weights}"     # catalog-qualified (MiMo carries image+video+AUDIO encoders; data would replicate all towers per rank)
+: "${CHAT_TEMPLATE_HOST_PATH:=}"       # optional custom .jinja
 : "${TORCH_PROFILE_HOST_DIR:=}"        # set to a host dir to enable /start_profile + /stop_profile
-: "${CONTAINER_MEMORY_GB:=}"           # cgroup cap so a runaway load cannot OOM the host (Luke uses 108)
-: "${ADAPTIVE_SPECULATIVE_TOKENS:=0}"  # mtp only; needs vllm pin >= e10536aa (2026-08-29)
-: "${ADAPTIVE_SPECULATIVE_TOKENS_WINDOW:=32}"
-# INITIAL defaults to min(3, depth) below once depth is known.
-# TP=2 InstantTensor staging bounds from the canonical launcher (bounds the
-# checkpoint-loading memory peak; harmless on older images).
-: "${INSTANTTENSOR_BUFFER_SIZE:=1342177280}"  # 1.25 GiB: the largest tensor is 1,268,776,960 B; 64 MiB just got auto-enlarged every boot
+: "${CONTAINER_MEMORY_GB:=}"           # cgroup cap so a runaway load cannot OOM the host
+: "${ASYNC_SCHEDULING:=}"              # 1 = --async-scheduling (NOT in the MiMo catalog contract; A/B)
+: "${PREFIX_RETENTION_INTERVAL:=}"     # --prefix-cache-retention-interval N (SWA checkpoints; NOT catalog-qualified for MiMo; block-size multiple)
+: "${SECCOMP_PROFILE:=}"               # REQUIRED for the b12x loader's io_uring ring: empty = runtime default seccomp (probe below dies if blocked); a PATH = --security-opt seccomp=<path>; unconfined = last resort. The shipped seccomp-io-uring.json is the target
+: "${VLLM_KV_CACHE_LAYOUT:=}"          # empty = engine auto; BLHNC (block-outermost) is required ONLY when mixing draft+target page sizes (DFlash A/B; fc27214ba9)
+# TP=2 InstantTensor staging bounds (inert under the b12x loader; only passed
+# when instanttensor is selected).
+: "${INSTANTTENSOR_BUFFER_SIZE:=1342177280}"
 : "${INSTANTTENSOR_IO_DEPTH:=3}"
 : "${INSTANTTENSOR_CONCURRENCY:=1}"
 : "${INSTANTTENSOR_CHUNK_SIZE:=8388608}"
-: "${API_KEY:=}"                       # empty = open port; set to require Authorization: Bearer <key> on rank 0 (from the template)
-: "${ENABLE_FLASHINFER_AUTOTUNE:=0}"   # 0 = --no-enable-flashinfer-autotune (canonical GLM recipe; B12X owns attention/MoE/linear); 1 = tune FlashInfer kernels at startup
-: "${MOE_BACKEND:=b12x}"               # b12x (qualified; the engine default since r34/#728) | humming | auto
-: "${ATTENTION_BACKEND:=B12X}"          # B12X (qualified GLM sparse-MLA + GDN path) | auto
-: "${LINEAR_BACKEND:=b12x}"            # restrict linear kernels to the b12x set
-: "${LANGUAGE_MODEL_ONLY:=1}"          # skip vision encoder cache + max-video profile buffers
-: "${MM_IMAGES:=4}"                    # per-prompt image cap when LANGUAGE_MODEL_ONLY=0
-: "${MM_VIDEOS:=1}"                    # per-prompt video cap when LANGUAGE_MODEL_ONLY=0
-: "${MAX_MODEL_LEN:=229376}"          # measured pair ceiling at util 0.90 is 235,008 tokens; this leaves ~11% margin
-: "${MAX_NUM_SEQS:=8}"
-: "${MAX_NUM_BATCHED_TOKENS:=4096}"   # qualified value; 8192 doubles the profiling activation peak
-: "${MAX_CUDAGRAPH_CAPTURE_SIZE:=96}"
-: "${CUDAGRAPH_MODE:=FULL_AND_PIECEWISE}" # FULL auto-downgrades to FULL_DECODE_ONLY on the GDN backend, leaving prefill EAGER; this adds piecewise prefill graphs
-: "${LOAD_FORMAT:=instanttensor}"
+: "${API_KEY:=}"                       # empty = open port; set to require Authorization: Bearer <key> on rank 0
+: "${ENABLE_FLASHINFER_AUTOTUNE:=0}"   # catalog kernels.flashinfer_autotune false; B12X owns attention/MoE/linear
+: "${MOE_BACKEND:=b12x}"               # catalog contract: b12x | humming | auto
+: "${ATTENTION_BACKEND:=B12X}"          # catalog contract: B12X | auto
+: "${LINEAR_BACKEND:=b12x}"            # catalog contract: b12x
+: "${LANGUAGE_MODEL_ONLY:=0}"          # 0 = image/video ON (the catalog serves the full multimodal checkpoint)
+: "${MM_IMAGES:=8}"                    # per-prompt image cap when LIMIT_MM=1 (groundwork value)
+: "${MM_VIDEOS:=0}"                    # per-prompt video cap when LIMIT_MM=1
+: "${MAX_MODEL_LEN:=262144}"          # groundwork value; the checkpoint ceiling is 1,048,576 (raise after a profiled boot)
+: "${MAX_NUM_SEQS:=4}"                 # catalog capacity value
+: "${MAX_NUM_BATCHED_TOKENS:=4096}"   # catalog value
+: "${MAX_CUDAGRAPH_CAPTURE_SIZE:=16}" # covers 4 seqs x (3+1) with headroom; catalog TP1 runs 64 at 16 seqs
+: "${CUDAGRAPH_MODE:=FULL_AND_PIECEWISE}" # catalog compilation value
+: "${LOAD_FORMAT:=b12x}"               # REQUIRED for MiMo (checkpoint + auxiliary-state loading lives in the b12x loader)
 : "${ENABLE_PREFIX_CACHING:=1}"
 : "${ENABLE_CHUNKED_PREFILL:=1}"
-: "${TRUST_REMOTE_CODE:=0}"
+: "${TRUST_REMOTE_CODE:=1}"            # catalog: trust_remote_code true
 : "${CONTAINER_RUNTIME:=docker}"
 : "${CONTAINER_NAME_SUFFIX:=}"
-: "${SERVING_IMAGE:=local/vllm:karmic-kraken-r1-cu133}"
+: "${SERVING_IMAGE:=local/vllm:karmic-kraken-beta-cu132}"
 : "${SHM_SIZE:=16g}"
 
 # Accept MTP=<n> as an alias for NUM_SPECULATIVE_TOKENS under SPECULATOR=mtp,
@@ -385,38 +393,20 @@ if [ -n "${MTP-}" ] && [ -z "${NUM_SPECULATIVE_TOKENS-}" ]; then
 fi
 
 case "$SPECULATOR" in
-  mtp)     : "${NUM_SPECULATIVE_TOKENS:=5}" ;;   # branch default
-  dflash2) : "${NUM_SPECULATIVE_TOKENS:=7}" ;;
   none)    : "${NUM_SPECULATIVE_TOKENS:=0}" ;;
-  *) die "SPECULATOR must be mtp, dflash2, or none: $SPECULATOR" ;;
+  mtp)     : "${NUM_SPECULATIVE_TOKENS:=3}" ;;   # in-checkpoint MTP head; depth A/B after first boot
+  *) die "SPECULATOR must be none or mtp: $SPECULATOR (dflash is deferred -- pro-lineage, needs a draft snapshot)" ;;
 esac
-
-case "$ADAPTIVE_SPECULATIVE_TOKENS" in 0|1) : ;; *) die "ADAPTIVE_SPECULATIVE_TOKENS must be 0 or 1" ;; esac
-if [ "$ADAPTIVE_SPECULATIVE_TOKENS" = 1 ]; then
-  [ "$SPECULATOR" = mtp ] && [ "$NUM_SPECULATIVE_TOKENS" -gt 0 ] \
-    || die "ADAPTIVE_SPECULATIVE_TOKENS requires SPECULATOR=mtp with positive depth"
-  if [ -z "${ADAPTIVE_SPECULATIVE_TOKENS_INITIAL:-}" ]; then
-    if [ "$NUM_SPECULATIVE_TOKENS" -lt 3 ]; then ADAPTIVE_SPECULATIVE_TOKENS_INITIAL=$NUM_SPECULATIVE_TOKENS
-    else ADAPTIVE_SPECULATIVE_TOKENS_INITIAL=3; fi
-  fi
-  require_positive_integer ADAPTIVE_SPECULATIVE_TOKENS_INITIAL
-  require_positive_integer ADAPTIVE_SPECULATIVE_TOKENS_WINDOW
-  [ "$ADAPTIVE_SPECULATIVE_TOKENS_INITIAL" -le "$NUM_SPECULATIVE_TOKENS" ] \
-    || die "ADAPTIVE_SPECULATIVE_TOKENS_INITIAL must not exceed NUM_SPECULATIVE_TOKENS"
-fi
 
 require_positive_integer PREFILL_SCHEDULE_INTERVAL
 case "$COMPILATION_LEVEL" in ""|0|1|2|3) : ;; *) die "COMPILATION_LEVEL must be empty or 0-3: $COMPILATION_LEVEL" ;; esac
 case "$GENERATION_CONFIG" in auto|vllm) : ;; *) die "GENERATION_CONFIG must be auto or vllm: $GENERATION_CONFIG" ;; esac
-case "$KDA_PREFILL_BACKEND" in ""|auto|triton|flashkda|flashinfer|b12x) : ;; *) die "KDA_PREFILL_BACKEND must be empty, auto, triton, flashkda, flashinfer, or b12x: $KDA_PREFILL_BACKEND" ;; esac
-case "$KDA_DECODE_BACKEND" in ""|auto|native|flashinfer|triton) : ;; *) die "KDA_DECODE_BACKEND must be empty, auto, native, flashinfer, or triton: $KDA_DECODE_BACKEND" ;; esac
-case "$GDN_DECODE_KERNEL" in ""|b12x|cuda|triton) : ;; *) die "GDN_DECODE_KERNEL must be empty, b12x, cuda, or triton: $GDN_DECODE_KERNEL" ;; esac
 [ -z "$FAIRNESS_ENGINE" ] || die "FAIRNESS_ENGINE=$FAIRNESS_ENGINE: --fairness-engine no longer exists on karmic-kraken; remove it and set PREFILL_COMPUTE_SHARE alone (with PREFILL_SCHEDULE_INTERVAL=1)"
-case "$DRAFT_SAMPLE_METHOD" in greedy|probabilistic) : ;; *) die "DRAFT_SAMPLE_METHOD must be greedy or probabilistic: $DRAFT_SAMPLE_METHOD" ;; esac
-case "$REJECTION_SAMPLE_METHOD" in standard|block|synthetic) : ;; *) die "REJECTION_SAMPLE_METHOD must be standard, block, or synthetic: $REJECTION_SAMPLE_METHOD" ;; esac
-case "$MTP_MOE_BACKEND" in b12x|marlin|humming|auto) : ;; *) die "MTP_MOE_BACKEND must be b12x, marlin, humming, or auto: $MTP_MOE_BACKEND" ;; esac
-case "$MTP_ATTENTION_BACKEND" in B12X|auto) : ;; *) die "MTP_ATTENTION_BACKEND must be B12X or auto: $MTP_ATTENTION_BACKEND" ;; esac
-case "$DFLASH_ATTENTION_BACKEND" in ""|FLASH_ATTN|B12X|auto) : ;; *) die "DFLASH_ATTENTION_BACKEND must be empty, FLASH_ATTN, B12X, or auto: $DFLASH_ATTENTION_BACKEND" ;; esac
+case "$SECCOMP_PROFILE" in
+  ""|unconfined) : ;;
+  /*) [ -f "$SECCOMP_PROFILE" ] || die "SECCOMP_PROFILE does not exist: $SECCOMP_PROFILE" ;;
+  *) [ -f "$SCRIPT_DIR/$SECCOMP_PROFILE" ] || [ -f "$SECCOMP_PROFILE" ] || die "SECCOMP_PROFILE does not exist: $SECCOMP_PROFILE" ;;
+esac
 case "$MAX_PARALLEL_PREFILLS" in ""|auto) : ;; *) require_positive_integer MAX_PARALLEL_PREFILLS ;; esac
 case "$LOAD_FORMAT" in
   instanttensor|fastsafetensors|auto|safetensors) : ;;
@@ -431,9 +421,6 @@ for name in SAMPLING_TEMPERATURE SAMPLING_TOP_P SAMPLING_TOP_K SAMPLING_MIN_P SA
   v=${!name-}
   [ -z "$v" ] || awk -v v="$v" 'BEGIN{ exit !(v ~ /^[0-9]*\.?[0-9]+$/) }' || die "$name must be a number: $v"
 done
-case "$REASONING_EFFORT" in ""|low|high|max) : ;; *) die "REASONING_EFFORT must be empty, low, high, or max: $REASONING_EFFORT" ;; esac
-case "$CLEAR_THINKING" in ""|0|1) : ;; *) die "CLEAR_THINKING must be empty, 0, or 1: $CLEAR_THINKING" ;; esac
-case "$RECURRENT_CHECKPOINT_POLICY" in ""|auto|request_boundaries|aligned) : ;; *) die "RECURRENT_CHECKPOINT_POLICY must be empty, auto, request_boundaries, or aligned: $RECURRENT_CHECKPOINT_POLICY" ;; esac
 if [ -n "$PREFILL_COMPUTE_SHARE" ]; then
   # KK SchedulerConfig: prefill_compute_share is a fraction in (0,1) or "auto",
   # and "cannot be combined with prefill_schedule_interval greater than one"
@@ -466,7 +453,7 @@ for name in \
   VLLM_HOST_IP NCCL_NET NCCL_NET_PLUGIN NCCL_IB_DISABLE NCCL_IB_HCA \
   NCCL_IB_GID_INDEX NCCL_IB_SUBNET_AWARE_ROUTING NCCL_IB_MERGE_NICS \
   NCCL_PROTO NCCL_P2P_LEVEL NCCL_CROSS_NIC NCCL_CUMEM_ENABLE \
-  NCCL_IGNORE_CPU_AFFINITY CUTE_DSL_ARCH \
+  NCCL_IGNORE_CPU_AFFINITY NCCL_TUNER_PLUGIN CUTE_DSL_ARCH \
   VLLM_ENABLE_PCIE_ALLREDUCE VLLM_B12X_MOE_FP4_FORCE_A16; do
   require_value "$name"
 done
@@ -487,28 +474,13 @@ ls "$MODEL_HOST_PATH"/*.safetensors >/dev/null 2>&1 \
   || die "MODEL_HOST_PATH contains no weight files (*.safetensors): $MODEL_HOST_PATH"
 [ -w "$CACHE_HOST_PATH" ] || die "CACHE_HOST_PATH is not writable: $CACHE_HOST_PATH"
 
-if [ "$SPECULATOR" = dflash2 ]; then
-  require_value DFLASH_MODEL_HOST_PATH
-  require_directory DFLASH_MODEL_HOST_PATH
-  [ -f "$DFLASH_MODEL_HOST_PATH/config.json" ] \
-    || die "DFLASH_MODEL_HOST_PATH has no config.json: $DFLASH_MODEL_HOST_PATH"
-  ls "$DFLASH_MODEL_HOST_PATH"/*.safetensors >/dev/null 2>&1 \
-    || die "DFLASH_MODEL_HOST_PATH contains no weight files: $DFLASH_MODEL_HOST_PATH"
-
-  # Optional but recommended: pin the draft by content. The r7 qualification
-  # publishes sha256 c033e03d... for the MXFP8 draft's model.safetensors; a
-  # mismatch means you are not serving the qualified weights.
-  if [ -n "${DFLASH_WEIGHTS_SHA256-}" ]; then
-    printf '%s' "$DFLASH_WEIGHTS_SHA256" | grep -Eq '^[0-9a-f]{64}$' \
-      || die "DFLASH_WEIGHTS_SHA256 must be 64 lowercase hex chars"
-    [ -f "$DFLASH_MODEL_HOST_PATH/model.safetensors" ] \
-      || die "DFLASH_WEIGHTS_SHA256 is set but $DFLASH_MODEL_HOST_PATH/model.safetensors does not exist (multi-shard drafts are not sha-pinned)"
-    echo "glm53 pair launcher: hashing draft weights (~1.2 GB, a few seconds)..." >&2
-    draft_sha=$(sha256sum "$DFLASH_MODEL_HOST_PATH/model.safetensors" | cut -d' ' -f1)
-    [ "$draft_sha" = "$DFLASH_WEIGHTS_SHA256" ] \
-      || die "draft weights sha256 mismatch: got $draft_sha, expected $DFLASH_WEIGHTS_SHA256 -- not the qualified checkpoint revision"
-  fi
-fi
+# MiMo checkpoint completeness (Luke's launcher checks these four): the b12x
+# loader needs the index + tokenizer + config, and a missing shard surfaces
+# only deep into the load otherwise.
+for mf in config.json tokenizer.json tokenizer_config.json model.safetensors.index.json; do
+  [ -f "$MODEL_HOST_PATH/$mf" ] \
+    || die "MODEL_HOST_PATH has no $mf (complete the snapshot; the b12x loader needs it): $MODEL_HOST_PATH"
+done
 
 for name in MAX_NUM_SEQS MAX_NUM_BATCHED_TOKENS MAX_CUDAGRAPH_CAPTURE_SIZE; do
   require_positive_integer "$name"
@@ -525,7 +497,7 @@ if [ "$MAX_MODEL_LEN" = -1 ]; then
 elif [ "$MAX_MODEL_LEN" != auto ]; then
   require_positive_integer MAX_MODEL_LEN
 else
-  warn "MAX_MODEL_LEN=auto resolves to the checkpoint maximum (1M for GLM-5.3); on a Spark pair the 1M profile can starve the KV pool and auto-fit the context below the attention page size -- set an explicit value (qualified: 262144)"
+  warn "MAX_MODEL_LEN=auto resolves to the checkpoint maximum (1,048,576 for MiMo); on a Spark pair that profile can starve the KV pool -- the groundwork value is 262144"
 fi
 
 case "$LANGUAGE_MODEL_ONLY" in
@@ -541,24 +513,31 @@ require_port MASTER_PORT
 
 require_unit_fraction GPU_MEMORY_UTILIZATION
 
-# Setting kv_cache_memory_bytes makes vLLM skip memory profiling entirely, and
-# gpu_memory_utilization is then ignored. Leave it empty for one boot to have
-# vLLM profile at GPU_MEMORY_UTILIZATION and log a suggested value to pin.
-# Remember GLM-5.3-Flash is a hybrid: the aligned mamba state cache lives in
-# the same reservation as the paged KV pool, so pin the number vLLM reports,
-# not one carried over from an attention-only model.
+# Setting kv_cache_memory_bytes makes vLLM skip memory PROFILING (pool sizing
+# comes from the pin), but GPU_MEMORY_UTILIZATION is NOT inert: the worker's
+# request_memory() gate (vllm/v1/worker/utils.py) still refuses to start when
+# CUDA-free-at-init < total x utilization -- on JJ and KK alike. Leave the pin
+# empty for one boot to have vLLM profile at GPU_MEMORY_UTILIZATION and log a
+# suggested value to pin. MiMo is a pure-attention hybrid (full + SWA
+# layers; NO mamba/GDN recurrent state), so the pool is paged KV only -- but
+# the SWA layers' checkpoints (prefix-cache retention) share the reservation.
 if [ -n "$KV_CACHE_MEMORY_BYTES" ]; then
   require_positive_integer KV_CACHE_MEMORY_BYTES
-  if grep -qE '^[[:space:]]*GPU_MEMORY_UTILIZATION=' "$env_file"; then
-    warn "KV_CACHE_MEMORY_BYTES is set; vLLM skips profiling and IGNORES GPU_MEMORY_UTILIZATION=$GPU_MEMORY_UTILIZATION"
-  fi
-else
-  # GB10 unified memory: a node reports ~121.7 GiB total with ~10.5 GiB held
-  # by the OS, so vLLM refuses any utilization above roughly 0.913 before it
-  # loads anything.
-  awk -v v="$GPU_MEMORY_UTILIZATION" 'BEGIN{ exit !(v+0 > 0.90) }' \
-    && warn "GPU_MEMORY_UTILIZATION=$GPU_MEMORY_UTILIZATION is at or past this node's free-memory ceiling (~0.913); vLLM refuses at startup when the request exceeds free memory"
-
+fi
+# GB10 unified memory: a node reports ~121.7 GiB total with ~10.5 GiB held by
+# the OS, so the gate refuses any utilization above roughly 0.913 on the cu132
+# images. The NGC-based cu133 images (jovian r35-cu133, karmic-kraken) reserve
+# ~13 GiB more at CUDA init: measured 2026-09-21, host MemFree 117.5 GiB but
+# CUDA-free 108.5/121.69 at the gate, so 0.90 (109.5 GiB) failed by 1 GiB and
+# 0.85 is the qualified value on that line.
+awk -v v="$GPU_MEMORY_UTILIZATION" 'BEGIN{ exit !(v+0 > 0.90) }' \
+  && warn "GPU_MEMORY_UTILIZATION=$GPU_MEMORY_UTILIZATION is at or past this node's free-memory ceiling (~0.913 on cu132 images); vLLM refuses at startup when the request exceeds CUDA-free memory"
+case "$VLLM_NCCL_SO_PATH" in
+  /opt/local-inference/nccl/*)
+    awk -v v="$GPU_MEMORY_UTILIZATION" 'BEGIN{ exit !(v+0 > 0.88) }' \
+      && warn "cu133-lineage image (NCCL under /opt/local-inference/nccl) with GPU_MEMORY_UTILIZATION=$GPU_MEMORY_UTILIZATION: this line's CUDA init leaves ~108.5/121.69 GiB free (ceiling ~0.89); the request_memory gate failed at 0.90 on 2026-09-21. Qualified value: 0.85 (the KV pin still sizes the pool)" ;;
+esac
+{
   if command -v nvidia-smi >/dev/null 2>&1; then
     mem_total=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
     mem_free=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
@@ -566,11 +545,11 @@ else
       ''|*[!0-9]*) ;;
       *)
         awk -v t="$mem_total" -v f="$mem_free" -v u="$GPU_MEMORY_UTILIZATION" \
-          'BEGIN{ want = t*u; if (want > f) printf "glm53 pair launcher: warning: GPU_MEMORY_UTILIZATION=%s asks for %.1f GiB but only %.1f GiB is free (ceiling %.4f); vLLM will refuse at startup\n", u, want/1024, f/1024, f/t > "/dev/stderr" }'
+          'BEGIN{ want = t*u; if (want > f) printf "mimo pair launcher: warning: GPU_MEMORY_UTILIZATION=%s asks for %.1f GiB but only %.1f GiB is free (ceiling %.4f); vLLM will refuse at startup\n", u, want/1024, f/1024, f/t > "/dev/stderr" }'
         ;;
     esac
   fi
-fi
+}
 
 for name in ENABLE_PREFIX_CACHING ENABLE_CHUNKED_PREFILL TRUST_REMOTE_CODE \
   VLLM_ENABLE_PCIE_ALLREDUCE VLLM_B12X_MOE_FP4_FORCE_A16; do
@@ -578,17 +557,17 @@ for name in ENABLE_PREFIX_CACHING ENABLE_CHUNKED_PREFILL TRUST_REMOTE_CODE \
 done
 
 case "$KV_CACHE_DTYPE" in
-  fp8|auto) ;;
-  fp8_ds_mla|nvfp4_ds_mla) warn "KV_CACHE_DTYPE=$KV_CACHE_DTYPE is an r26+ value (packed NVFP4 KV is nvfp4_ds_mla); older images reject it" ;;
-  *) die "KV_CACHE_DTYPE must be fp8, auto, fp8_ds_mla, or nvfp4_ds_mla: $KV_CACHE_DTYPE" ;;
-esac
-case "$DFLASH_KV_CACHE_DTYPE" in
-  fp8|auto) ;;
-  *) die "DFLASH_KV_CACHE_DTYPE must be fp8 or auto: $DFLASH_KV_CACHE_DTYPE" ;;
+  bfloat16|auto) ;;
+  fp8) warn "KV_CACHE_DTYPE=fp8 is UNVERIFIED for MiMo's 192-dim attention (the catalog qualifies bfloat16); treat as an A/B and check outputs" ;;
+  *) die "KV_CACHE_DTYPE must be bfloat16, auto, or fp8: $KV_CACHE_DTYPE" ;;
 esac
 case "$CUDAGRAPH_MODE" in
   FULL|FULL_AND_PIECEWISE|PIECEWISE|NONE) ;;
   *) die "CUDAGRAPH_MODE must be FULL, FULL_AND_PIECEWISE, PIECEWISE, or NONE: $CUDAGRAPH_MODE" ;;
+esac
+case "$VLLM_KV_CACHE_LAYOUT" in
+  ""|BLHNC|LBHNC|HNC|NHC|LNC|CNL) : ;;
+  *) die "VLLM_KV_CACHE_LAYOUT must be empty or a layout name (BLHNC for the mixed-page DFlash A/B): $VLLM_KV_CACHE_LAYOUT" ;;
 esac
 
 # GB10 is sm_121; the RTX Pro 6000 recipes this derives from use sm_120a.
@@ -626,12 +605,6 @@ case "$LINEAR_BACKEND" in
   *)    warn "LINEAR_BACKEND=$LINEAR_BACKEND is off the qualified recipe (b12x)" ;;
 esac
 
-# DFlash2 drafts a fixed eight-token block: one verified token plus seven
-# draft tokens. Other values are legal but off the trained block size.
-if [ "$SPECULATOR" = dflash2 ] && [ "$NUM_SPECULATIVE_TOKENS" != 7 ]; then
-  warn "DFlash2 is trained for 7 draft tokens (8-token block); NUM_SPECULATIVE_TOKENS=$NUM_SPECULATIVE_TOKENS is off the trained configuration"
-fi
-
 # One decode step must fit in a batch: max_num_seqs * (spec tokens + 1).
 decode_batch=$(( MAX_NUM_SEQS * (NUM_SPECULATIVE_TOKENS + 1) ))
 if [ "$decode_batch" -gt "$MAX_CUDAGRAPH_CAPTURE_SIZE" ]; then
@@ -647,24 +620,30 @@ fi
   || die "NCCL_SOCKET_IFNAME and GLOO_SOCKET_IFNAME must match on a pair"
 [ "$NCCL_NET" = IB ] || die "NCCL_NET must be IB"
 [ "$NCCL_NET_PLUGIN" = none ] || die "NCCL_NET_PLUGIN must be none"
+[ "$NCCL_TUNER_PLUGIN" = none ] || die "NCCL_TUNER_PLUGIN must be none (no tuner plugin ships in the image; Luke's launcher and the published preset both pin none)"
 # The image bakes NCCL_IB_DISABLE=1 for single-node PCIe boxes; the env file
 # must override it back to 0 or the pair silently falls back to TCP sockets.
 [ "$NCCL_IB_DISABLE" = 0 ] || die "NCCL_IB_DISABLE must be 0 (the serving image bakes 1 for single-node use; override it in the env file)"
-# Two validated fabric profiles:
-#   single-rail (default): MERGE_NICS=0, SUBNET_AWARE_ROUTING=0, one HCA
-#   dual-rail (Luke's TP2 Spark launcher): MERGE_NICS=1,
-#     SUBNET_AWARE_ROUTING=1, both rails listed in NCCL_IB_HCA -- NCCL
-#     merges the two direct RoCE links for ~2x cross-node bandwidth.
-# The two knobs must move together; a mixed setting is a misconfiguration.
+# Fabric profiles:
+#   single-path (validated here): MERGE_NICS=0, SUBNET_AWARE_ROUTING=0, one
+#     HCA (rocep1s0f0 = enp1s0f0np0).
+#   dual-path (Luke's Spark launchers, 2026-09-21): MERGE_NICS=1 with BOTH
+#     Linux interfaces of the cabled QSFP port in NCCL_IB_HCA
+#     (rocep1s0f0,roceP2p1s0f0). They are the two PCIe Gen5 x4 paths into
+#     the same CX-7, not a second cable: one 200G link, striped over both
+#     PCIe paths (Luke: 196 Gb/s combined vs a single-path cap). The second
+#     interface needs its own IPv4 (own /24) so GID index 3 is populated;
+#     RoCEnante picks up to two HCAs from NCCL_IB_HCA the same way.
+#     SUBNET_AWARE_ROUTING is no longer part of that profile (dropped
+#     upstream at 9e5d179); it only matters when the two paths sit on
+#     different subnets behind a switch, so it is allowed either way.
 if [ "$NCCL_IB_MERGE_NICS" = 1 ]; then
-  [ "$NCCL_IB_SUBNET_AWARE_ROUTING" = 1 ] \
-    || die "dual-rail profile requires NCCL_IB_SUBNET_AWARE_ROUTING=1 with NCCL_IB_MERGE_NICS=1"
   case "$NCCL_IB_HCA" in
     *,*) : ;;
-    *) warn "NCCL_IB_MERGE_NICS=1 with a single HCA in NCCL_IB_HCA -- dual-rail wants both rails listed (e.g. rocep1s0f0,rocep1s0f1)" ;;
+    *) warn "NCCL_IB_MERGE_NICS=1 with a single HCA in NCCL_IB_HCA -- dual-path wants both interfaces of the cabled port (e.g. rocep1s0f0,roceP2p1s0f0), each with its own IPv4 so GID $NCCL_IB_GID_INDEX exists on both" ;;
   esac
 elif [ "$NCCL_IB_SUBNET_AWARE_ROUTING" != 0 ]; then
-  warn "NCCL_IB_SUBNET_AWARE_ROUTING=$NCCL_IB_SUBNET_AWARE_ROUTING with NCCL_IB_MERGE_NICS=0: off the validated single-rail profile (0/0); upstream's TP2 Spark launcher runs 1/0, so this is allowed but unmeasured here"
+  warn "NCCL_IB_SUBNET_AWARE_ROUTING=$NCCL_IB_SUBNET_AWARE_ROUTING with NCCL_IB_MERGE_NICS=0: off the validated single-path profile (0/0); allowed but unmeasured here"
 fi
 [ "$NCCL_PROTO" = LL,LL128,Simple ] || die "NCCL_PROTO must be LL,LL128,Simple"
 [ "$NCCL_P2P_LEVEL" = SYS ] || die "NCCL_P2P_LEVEL must be SYS"
@@ -675,6 +654,15 @@ fi
 case ":$LD_PRELOAD:" in
   *":$VLLM_NCCL_SO_PATH:"*) ;;
   *) die "LD_PRELOAD must include VLLM_NCCL_SO_PATH ($VLLM_NCCL_SO_PATH)" ;;
+esac
+# The cu133 images ship NGC's forward-compat libcuda (R610, under
+# /usr/local/cuda/compat/lib.real/). Preloading it on a DGX Spark takes every
+# process down silently during torch's driver init (measured 2026-09-21,
+# host driver 580.173.02): GB10 is not forward-compat hardware, and the 13.3
+# toolkit runs on 580 under minor-version compatibility without it. The path
+# exists in the image, so the image check below cannot catch this.
+case ":$LD_PRELOAD:" in
+  *"/cuda/compat/lib.real/"*) warn "LD_PRELOAD carries the NGC forward-compat libcuda (compat/lib.real); on this pair that crashed torch's CUDA init with no traceback (host driver 580.173.02 vs compat R610). cu133 images need only the NCCL preload: LD_PRELOAD=$VLLM_NCCL_SO_PATH" ;;
 esac
 
 [ "$NODE_RANK" != 0 ] || [ "$MASTER_ADDR" = "$VLLM_HOST_IP" ] \
@@ -697,9 +685,9 @@ if [ "$MEM_PREFLIGHT" != off ] && [ -r /proc/meminfo ] && [ -z "$KV_CACHE_MEMORY
   required_kib=$(awk -v t="$mem_total_kib" -v u="$GPU_MEMORY_UTILIZATION" 'BEGIN{printf "%d", t*u}')
   if [ "$mem_free_kib" -lt "$required_kib" ]; then
     deficit_gib=$(awk -v r="$required_kib" -v f="$mem_free_kib" 'BEGIN{printf "%.1f", (r-f)/1048576}')
-    stale="$(docker ps --format '{{.Names}}' 2>/dev/null | grep -c '^glm53-flash-r' || true)"
+    stale="$(docker ps --format '{{.Names}}' 2>/dev/null | grep -c '^mimo-v26-flash-r' || true)"
     if [ "${stale:-0}" -gt 0 ]; then
-      die "only $(awk -v f="$mem_free_kib" 'BEGIN{printf "%.1f", f/1048576}') GiB free but utilization $GPU_MEMORY_UTILIZATION needs ~$(awk -v r="$required_kib" 'BEGIN{printf "%.1f", r/1048576}') GiB (short $deficit_gib GiB) -- a glm53-flash container is already running on this host; --down it first"
+      die "only $(awk -v f="$mem_free_kib" 'BEGIN{printf "%.1f", f/1048576}') GiB free but utilization $GPU_MEMORY_UTILIZATION needs ~$(awk -v r="$required_kib" 'BEGIN{printf "%.1f", r/1048576}') GiB (short $deficit_gib GiB) -- a mimo-v26-flash container is already running on this host; --down it first"
     elif [ "$mem_avail_kib" -ge "$required_kib" ]; then
       cache_gib=$(awk -v a="$mem_avail_kib" -v f="$mem_free_kib" 'BEGIN{printf "%.1f", (a-f)/1048576}')
       msg="MemFree=$(awk -v f="$mem_free_kib" 'BEGIN{printf "%.1f", f/1048576}') GiB is $deficit_gib GiB short of utilization $GPU_MEMORY_UTILIZATION, but MemAvailable=$(awk -v a="$mem_avail_kib" 'BEGIN{printf "%.1f", a/1048576}') GiB suffices: ~$cache_gib GiB of reclaimable page cache (a previous model load) is counting against CUDA free memory. Dashboards show total-minus-available, so the node LOOKS idle -- but vLLM's own startup gate reads CUDA-free (~MemFree) and will refuse, exactly as it did at 105.19/121.69 GiB previously. Reclaim: sync && echo 3 | sudo tee /proc/sys/vm/drop_caches -- then relaunch (MEM_PREFLIGHT=warn to proceed anyway)"
@@ -791,26 +779,37 @@ if [ "${SKIP_IMAGE_PRELOAD_CHECK:-0}" != 1 ] \
     || die "LD_PRELOAD names path(s) absent from the image:$preload_missing -- every process in the container would fail at exec"
 fi
 
+# io_uring probe for the b12x loader: the loader reads weights through an
+# O_DIRECT io_uring ring (b12x 1ec67ef6); a blocked io_uring_setup (older
+# Docker / Podman default seccomp) fails deep in the load with EPERM and no
+# name. Probe it inside the image at --check and say the fix. io_uring_setup
+# is syscall 425 on x86_64 AND aarch64; with NULL params an allowed kernel
+# answers -EFAULT (bad params), seccomp answers -EPERM.
+if [ "$LOAD_FORMAT" = b12x ] \
+   && command -v "$CONTAINER_RUNTIME" >/dev/null 2>&1 \
+   && "$CONTAINER_RUNTIME" image inspect "$SERVING_IMAGE" >/dev/null 2>&1; then
+  seccomp_args=()
+  if [ -n "$SECCOMP_PROFILE" ]; then
+    _sp="$SECCOMP_PROFILE"; case "$_sp" in /*) ;; *) _sp="$SCRIPT_DIR/$_sp" ;; esac
+    seccomp_args=(--security-opt "seccomp=$_sp")
+  fi
+  probe_out="$("$CONTAINER_RUNTIME" run --rm "${seccomp_args[@]}" \
+    --entrypoint /opt/venv/bin/python "$SERVING_IMAGE" -c '
+import ctypes, errno
+libc = ctypes.CDLL(None, use_errno=True)
+libc.syscall(425, 0, 0)
+err = ctypes.get_errno()
+raise SystemExit("BLOCKED" if err == errno.EPERM else "OK")
+' 2>&1 || true)"
+  case "$probe_out" in
+    *BLOCKED*) die "io_uring is BLOCKED inside the container (seccomp) -- the b12x loader reads weights through an io_uring ring, so every weight read would fail with EPERM. Set SECCOMP_PROFILE=seccomp-io-uring.json (shipped next to this script) or upgrade the container runtime" ;;
+  esac
+fi
+
 # ----------------------------------------------------------- launch command
 
 container_name="$mgmt_container"
-model_container_path=/models/glm-5.3-flash-nvfp4
-dflash_container_path=/models/glm-5.3-flash-dflash2
-
-# Split cache pages are the operator's call and must be explicit in the env
-# file (they reach the container via --env-file). --check only verifies the
-# combination against what was measured on pin 54f6e982 (2026-09-02):
-#   dflash2 without them -> boot fails ("parent-page stride must be an exact
-#     number of C4 pages"); 4096/4096 boots (731,620 tokens, 12 GiB pin).
-#   mtp with 512 -> pool ~10x smaller (13.74 GiB per 262k request); with
-#     4096 -> no measured gain over the coupled default.
-if [ "$SPECULATOR" = dflash2 ]; then
-  if [ -z "${VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE-}" ] || [ -z "${VLLM_GLM53_SPLIT_MAMBA_BLOCK_SIZE-}" ]; then
-    warn "SPECULATOR=dflash2 without split cache pages: at pin 54f6e982 this failed at boot. Add to BOTH env files: VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE=4096 and VLLM_GLM53_SPLIT_MAMBA_BLOCK_SIZE=4096"
-  fi
-elif [ -n "${VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE-}" ] && [ "${VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE}" -lt 2048 ] 2>/dev/null; then
-  warn "VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE=$VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE under SPECULATOR=$SPECULATOR: on pins before #669 (2026-09-06), 512 inflated every slot to the recurrent page (13.74 GiB per 262k request). Pins >= db7a65e2 handle small targets (upstream runs 512/512; El8 2048/256); older pins want 2048 or the coupled default"
-fi
+model_container_path=/models/mimo-v2.6-flash-rl
 
 # The INSTANTTENSOR_* staging bounds are read by the instanttensor library
 # only; under any other loader they are inert, so they are passed only when
@@ -834,38 +833,34 @@ case "$INSTANTTENSOR_COPY" in
   *) die "INSTANTTENSOR_COPY must be auto, 0, or 1" ;;
 esac
 [ -z "$COMPILATION_LEVEL" ] || extra_args+=("-O$COMPILATION_LEVEL")
-[ -z "$KDA_PREFILL_BACKEND" ] || extra_args+=(--kda-prefill-backend "$KDA_PREFILL_BACKEND")
-[ -z "$GDN_DECODE_KERNEL" ] || extra_args+=(--gdn-decode-kernel "$GDN_DECODE_KERNEL")
-[ -z "$KDA_DECODE_BACKEND" ] || extra_args+=(--kda-decode-backend "$KDA_DECODE_BACKEND")
-[ -z "$PREFILL_COMPUTE_HALF_LIFE" ] || extra_args+=(--prefill-compute-half-life "$PREFILL_COMPUTE_HALF_LIFE")
-[ -z "$MAX_PARALLEL_PREFILLS" ] || extra_args+=(--max-parallel-prefills "$MAX_PARALLEL_PREFILLS")
-[ -z "$RECURRENT_CHECKPOINT_POLICY" ] || extra_args+=(--recurrent-checkpoint-policy "$RECURRENT_CHECKPOINT_POLICY")
-# Sampling and chat-template defaults are built HERE (JSON in a sourced env
-# file loses its quotes). Per-request fields still override them.
-sampling_json=""
-[ -z "$SAMPLING_TEMPERATURE" ] || sampling_json="\"temperature\":$SAMPLING_TEMPERATURE"
-[ -z "$SAMPLING_TOP_P" ] || sampling_json="${sampling_json:+$sampling_json,}\"top_p\":$SAMPLING_TOP_P"
-[ -z "$SAMPLING_TOP_K" ] || sampling_json="${sampling_json:+$sampling_json,}\"top_k\":$SAMPLING_TOP_K"
-[ -z "$SAMPLING_MIN_P" ] || sampling_json="${sampling_json:+$sampling_json,}\"min_p\":$SAMPLING_MIN_P"
-[ -z "$SAMPLING_REPETITION_PENALTY" ] || sampling_json="${sampling_json:+$sampling_json,}\"repetition_penalty\":$SAMPLING_REPETITION_PENALTY"
-[ -z "$sampling_json" ] || extra_args+=(--override-generation-config "{$sampling_json}")
-template_json=""
-[ -z "$REASONING_EFFORT" ] || template_json="\"reasoning_effort\":\"$REASONING_EFFORT\""
-if [ -n "$CLEAR_THINKING" ]; then
-  ct=false; [ "$CLEAR_THINKING" = 1 ] && ct=true
-  template_json="${template_json:+$template_json,}\"clear_thinking\":$ct"
-fi
-[ -z "$template_json" ] || extra_args+=(--default-chat-template-kwargs "{$template_json}")
+if [ "$ASYNC_SCHEDULING" = 1 ]; then extra_args+=(--async-scheduling); fi
+[ -z "$PREFIX_RETENTION_INTERVAL" ] || extra_args+=(--prefix-cache-retention-interval "$PREFIX_RETENTION_INTERVAL")
 [ -z "$PREFILL_COMPUTE_SHARE" ] || extra_args+=(--prefill-compute-share "$PREFILL_COMPUTE_SHARE")
 [ -z "$MM_PROCESSOR_CACHE_GB" ] || extra_args+=(--mm-processor-cache-gb "$MM_PROCESSOR_CACHE_GB")
 [ -z "$MM_ENCODER_TP_MODE" ] || extra_args+=(--mm-encoder-tp-mode "$MM_ENCODER_TP_MODE")
-[ "$GENERATION_CONFIG" = auto ] || extra_args+=(--generation-config "$GENERATION_CONFIG")
+# generation-config: default vllm is emitted literally in the command;
+# only emit here when set to something else.
+[ "$GENERATION_CONFIG" = "vllm" ] || [ "$GENERATION_CONFIG" = auto ] || extra_args+=(--generation-config "$GENERATION_CONFIG")
 chat_template_container_path=/models/chat_template.jinja
 [ -z "$CHAT_TEMPLATE_HOST_PATH" ] || extra_args+=(--chat-template "$chat_template_container_path")
 
 quantization_args=()
 if [ "$QUANTIZATION" != auto ]; then
   quantization_args=(--quantization "$QUANTIZATION")
+fi
+
+# Sampling overrides: empty = Luke's launcher literal (1.0/0.95); any knob set
+# builds the JSON instead (the literal flag is emitted as ${sampling_override_args}).
+sampling_json=""
+[ -z "$SAMPLING_TEMPERATURE" ] || sampling_json="\"temperature\":$SAMPLING_TEMPERATURE"
+[ -z "$SAMPLING_TOP_P" ] || sampling_json="${sampling_json:+$sampling_json,}\"top_p\":$SAMPLING_TOP_P"
+[ -z "$SAMPLING_TOP_K" ] || sampling_json="${sampling_json:+$sampling_json,}\"top_k\":$SAMPLING_TOP_K"
+[ -z "$SAMPLING_MIN_P" ] || sampling_json="${sampling_json:+$sampling_json,}\"min_p\":$SAMPLING_MIN_P"
+[ -z "$SAMPLING_REPETITION_PENALTY" ] || sampling_json="${sampling_json:+$sampling_json,}\"repetition_penalty\":$SAMPLING_REPETITION_PENALTY"
+if [ -n "$sampling_json" ]; then
+  sampling_override_args=(--override-generation-config "{$sampling_json}")
+else
+  sampling_override_args=(--override-generation-config '{"temperature":1.0,"top_p":0.95}')
 fi
 
 lm_only_args=()
@@ -901,38 +896,18 @@ speculative_args=()
 if [ "$SPECULATOR" != none ] && [ "$NUM_SPECULATIVE_TOKENS" -gt 0 ]; then
   case "$SPECULATOR" in
     mtp)
-      # The MTP head is BF16 in this checkpoint. karmic-kraken: b12x carries
-      # its MoE and B12X its attention (published Spark TP2 preset); the
-      # proposal head format is VLLM_GLM53_MTP_DRAFT_HEAD (env file).
-      # draft_sample_method defaults to greedy in the engine; the published
-      # GLM contract is probabilistic + standard rejection, so both are
-      # emitted explicitly.
-      adaptive_fields=
-      if [ "$ADAPTIVE_SPECULATIVE_TOKENS" = 1 ]; then
-        adaptive_fields=$(printf ',"adaptive_speculative_tokens_window":%s,"adaptive_speculative_tokens_initial":%s' \
-          "$ADAPTIVE_SPECULATIVE_TOKENS_WINDOW" "$ADAPTIVE_SPECULATIVE_TOKENS_INITIAL")
-      fi
-      speculative_config=$(printf \
-        '{"method":"mtp","num_speculative_tokens":%s,"draft_sample_method":"%s","rejection_sample_method":"%s","moe_backend":"%s","attention_backend":"%s"%s}' \
-        "$NUM_SPECULATIVE_TOKENS" "$DRAFT_SAMPLE_METHOD" "$REJECTION_SAMPLE_METHOD" "$MTP_MOE_BACKEND" "$MTP_ATTENTION_BACKEND" "$adaptive_fields")
-      ;;
-    dflash2)
-      # Works for both draft checkpoints: BF16 (incoai/GLM-5.3-Flash-DFlash2)
-      # and MXFP8 (local-inference-lab/GLM-5.3-Flash-DFlash2-MXFP8) -- the
-      # quantization is read from the checkpoint config; point
-      # DFLASH_MODEL_HOST_PATH at whichever is downloaded. kv_cache_dtype
-      # auto (BF16) is the qualified value for both.
-      dflash_attention_json=
-      [ -z "$DFLASH_ATTENTION_BACKEND" ] || dflash_attention_json=$(printf ',"attention_backend":"%s"' "$DFLASH_ATTENTION_BACKEND")
-      speculative_config=$(printf \
-        '{"method":"dflash","model":"%s","num_speculative_tokens":%s,"kv_cache_dtype":"%s","draft_sample_method":"%s","rejection_sample_method":"%s"%s}' \
-        "$dflash_container_path" "$NUM_SPECULATIVE_TOKENS" "$DFLASH_KV_CACHE_DTYPE" "$DRAFT_SAMPLE_METHOD" "$REJECTION_SAMPLE_METHOD" "$dflash_attention_json")
+      # Luke's MiMo launcher shape: the in-checkpoint MTP head needs ONLY
+      # method + depth (no backend keys, no sampling keys -- the engine
+      # default greedy applies; the catalog leaves speculators unqualified).
+      speculative_config=$(printf '{"method":"mtp","num_speculative_tokens":%s}' "$NUM_SPECULATIVE_TOKENS")
       ;;
   esac
   speculative_args=(--speculative-config "$speculative_config")
 fi
 
-compilation_config=$(printf '{"cudagraph_mode":"%s","custom_ops":["all"]}' "$CUDAGRAPH_MODE")
+# Catalog compilation contract for MiMo: custom_ops none (GLM/Qwen force
+# ["all"]; MiMo's qualified config does not).
+compilation_config=$(printf '{"cudagraph_mode":"%s","custom_ops":["%s"]}' "$CUDAGRAPH_MODE" "${CUSTOM_OPS:-none}")
 
 case "$CONTAINER_RUNTIME" in
   podman) gpu_args=(--device nvidia.com/gpu=all --security-opt label=disable) ;;
@@ -943,9 +918,6 @@ mount_args=(
   -v "$MODEL_HOST_PATH:$model_container_path:ro"
   -v "$CACHE_HOST_PATH:/cache"
 )
-if [ "$SPECULATOR" = dflash2 ]; then
-  mount_args+=(-v "$DFLASH_MODEL_HOST_PATH:$dflash_container_path:ro")
-fi
 if [ -n "$CHAT_TEMPLATE_HOST_PATH" ]; then
   mount_args+=(-v "$CHAT_TEMPLATE_HOST_PATH:$chat_template_container_path:ro")
 fi
@@ -965,6 +937,7 @@ command=(
   --ulimit memlock=-1:-1
   ${CONTAINER_MEMORY_GB:+--memory ${CONTAINER_MEMORY_GB}g --memory-swap $((${CONTAINER_MEMORY_GB:-0}+4))g}
   --device /dev/infiniband
+  ${SECCOMP_PROFILE:+--security-opt seccomp="$([ "${SECCOMP_PROFILE:0:1}" = / ] && echo "$SECCOMP_PROFILE" || echo "$SCRIPT_DIR/$SECCOMP_PROFILE")"}
   "${mount_args[@]}"
   --env-file "$env_file"
   # The image bakes VLLM_PCIE_ALLREDUCE_BACKEND=cpp (the pre-rename value).
@@ -996,14 +969,13 @@ command=(
   --kv-cache-dtype "$KV_CACHE_DTYPE"
   --block-size "$BLOCK_SIZE"
 
-  # --- model / kernels (canonical GLM-5.3-Flash-NVFP4 recipe) --------------
+  # --- model / kernels (catalog contract: b12x everything, BF16 KV) --------
   --dtype bfloat16
   "${quantization_args[@]}"
   --attention-backend "$ATTENTION_BACKEND"
   --moe-backend "$MOE_BACKEND"
   --linear-backend "$LINEAR_BACKEND"
   "${lm_only_args[@]}"
-  --mamba-cache-mode align
   --load-format "$LOAD_FORMAT"
   --compilation-config "$compilation_config"
   --max-cudagraph-capture-size "$MAX_CUDAGRAPH_CAPTURE_SIZE"
@@ -1014,10 +986,12 @@ command=(
   --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS"
   "${extra_args[@]}"
 
-  # --- model behaviour ----------------------------------------------------
-  --reasoning-parser glm45
-  --tool-call-parser glm47
+  # --- model behaviour (catalog: mimo parsers, generation-config vllm) -----
+  --reasoning-parser mimo
+  --tool-call-parser mimo
   --enable-auto-tool-choice
+  --generation-config vllm
+  ${sampling_override_args[@]}
   "${speculative_args[@]}"
   --served-model-name "$SERVED_MODEL_NAME"
 
@@ -1051,15 +1025,12 @@ printf "Local rank input checks passed.\n"
 printf '  rank:                    %s\n' "$NODE_RANK"
 printf '  runtime:                 %s\n' "$CONTAINER_RUNTIME"
 printf '  model:                   %s\n' "$MODEL_HOST_PATH"
-if [ "$SPECULATOR" = dflash2 ]; then
-  printf '  draft model:             %s\n' "$DFLASH_MODEL_HOST_PATH"
-fi
 printf '  cache:                   %s\n' "$CACHE_HOST_PATH"
 printf '  MAX_MODEL_LEN:           %s\n' "$MAX_MODEL_LEN"
 printf '  MAX_NUM_SEQS:            %s\n' "$MAX_NUM_SEQS"
 printf '  MAX_NUM_BATCHED_TOKENS:  %s\n' "$MAX_NUM_BATCHED_TOKENS"
-printf '  SPECULATOR:              %s (%s draft tokens, %s draft sampling, %s rejection)\n' \
-  "$SPECULATOR" "$NUM_SPECULATIVE_TOKENS" "$DRAFT_SAMPLE_METHOD" "$REJECTION_SAMPLE_METHOD"
+printf '  SPECULATOR:              %s (%s draft tokens)\n' \
+  "$SPECULATOR" "$NUM_SPECULATIVE_TOKENS"
 if [ -n "$PREFILL_COMPUTE_SHARE" ]; then
   printf '  PREFILL:                 compute share %s, interval %s%s\n' "$PREFILL_COMPUTE_SHARE" "$PREFILL_SCHEDULE_INTERVAL" "${MAX_PARALLEL_PREFILLS:+, max parallel $MAX_PARALLEL_PREFILLS}"
 else
@@ -1068,7 +1039,7 @@ fi
 printf '  KV_CACHE_MEMORY_BYTES:   %s (%s)\n' \
   "${KV_CACHE_MEMORY_BYTES:-profiled at $GPU_MEMORY_UTILIZATION}" "$KV_CACHE_DTYPE"
 if [ -n "$KV_CACHE_MEMORY_BYTES" ]; then
-  printf '  GPU_MEMORY_UTILIZATION:  %s (IGNORED - bytes are pinned)\n' "$GPU_MEMORY_UTILIZATION"
+  printf '  GPU_MEMORY_UTILIZATION:  %s (startup free-memory gate only; pool size comes from the pin)\n' "$GPU_MEMORY_UTILIZATION"
 else
   printf '  GPU_MEMORY_UTILIZATION:  %s\n' "$GPU_MEMORY_UTILIZATION"
 fi

@@ -6,8 +6,9 @@
 #
 # TARGET STACK, not generic vLLM. This launcher assumes an aarch64/sm_121
 # image built by build-spark-cu132.sh from:
-#   - local-inference-lab/vllm, branch dev/jovian-judgement
-#   - local-inference-lab/sparkinfer (B12X) kernels
+#   - local-inference-lab/vllm, branch dev/karmic-kraken @ 57fdda71
+#   - local-inference-lab/b12x @ 8a99d639 (the kk-beta-cu132 profile; kk-beta
+#     nomenclature until Luke confirms the r1 tag scheme)
 #   - the patched NCCL + CUDA compat shim that image carries
 # Many flags emitted below (--attention-backend B12X, --moe-backend b12x,
 # --linear-backend, --gdn-decode-kernel, --recurrent-checkpoint-policy,
@@ -523,7 +524,7 @@ model_defaults   # hook: model fallbacks
 : "${ADAPTIVE_SPECULATIVE_TOKENS:=0}"        # 0 = fixed depth (GLM-5.3: static 3 measured better at c1-c4); 1 = adaptive
 : "${ADAPTIVE_SPECULATIVE_TOKENS_INITIAL:=}" # starting depth when adaptive; empty = min(3, NUM_SPECULATIVE_TOKENS)
 : "${ADAPTIVE_SPECULATIVE_TOKENS_WINDOW:=32}" # verification steps per depth adjustment
-: "${SERVING_IMAGE:=}"                       # required: image tag or digest present on BOTH nodes
+: "${SERVING_IMAGE:=local/vllm:karmic-kraken-beta-cu132}"  # default: the kk-beta-cu132 build; override with a tag/digest present on BOTH nodes
 : "${MEM_PREFLIGHT:=die}"                    # die | warn | off -- host free-memory gate below
 : "${FABRIC_PROFILE:=single}"                # single | dual -- see the fabric checks below
 # Scheduler/loader/profiling knobs. All default to "omit the flag" so the
@@ -574,7 +575,7 @@ for name in \
   VLLM_HOST_IP NCCL_NET NCCL_NET_PLUGIN NCCL_IB_DISABLE NCCL_IB_HCA \
   NCCL_IB_GID_INDEX NCCL_IB_SUBNET_AWARE_ROUTING NCCL_IB_MERGE_NICS \
   NCCL_PROTO NCCL_P2P_LEVEL NCCL_CROSS_NIC NCCL_CUMEM_ENABLE \
-  NCCL_IGNORE_CPU_AFFINITY CUTE_DSL_ARCH VLLM_ENABLE_PCIE_ALLREDUCE; do
+  NCCL_IGNORE_CPU_AFFINITY NCCL_TUNER_PLUGIN CUTE_DSL_ARCH VLLM_ENABLE_PCIE_ALLREDUCE; do
   require_value "$name"
 done
 
@@ -801,6 +802,7 @@ model_validate   # hook: model-specific keys and known-bad combinations
   || die "NCCL_SOCKET_IFNAME and GLOO_SOCKET_IFNAME must match on a pair"
 [ "$NCCL_NET" = IB ] || die "NCCL_NET must be IB (RoCE presents IB semantics over Ethernet)"
 [ "$NCCL_NET_PLUGIN" = none ] || die "NCCL_NET_PLUGIN must be none"
+[ "$NCCL_TUNER_PLUGIN" = none ] || die "NCCL_TUNER_PLUGIN must be none (no tuner plugin ships in the image; the published preset and Luke's launcher both pin none)"
 [ "$NCCL_IB_DISABLE" = 0 ] || die "NCCL_IB_DISABLE must be 0 (the image bakes 1 for single-node use; override it in the env file or the pair silently falls back to TCP)"
 # FABRIC_PROFILE selects the cabling, and the launcher then enforces every
 # knob that follows from it. It is named explicitly rather than inferred from
@@ -1099,6 +1101,12 @@ command=(
   --distributed-executor-backend mp
   --pipeline-parallel-size 1
   --decode-context-parallel-size 1
+  # DCP1 on the pair by FABRIC choice: KK delta #2 added QSA decode context
+  # parallelism (vllm #819 + b12x #406), but its all-gather transport is the
+  # PCIe path (b12x/comm/pcie) -- a RoCE pair cannot use it. (The upstream
+  # doc's "QSA rejects context parallelism" is stale at this pin.)
+  # No REPLAYSSM knob here: recovery eligibility is Glm5Next/Kimi only --
+  # Qwen auto-resolves OFF; do not port the GLM knob.
 
   # --- memory --------------------------------------------------------------
   --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"

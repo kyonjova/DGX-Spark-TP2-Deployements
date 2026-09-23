@@ -7,11 +7,8 @@
 # its own default". The launcher validates every value at --check time.
 #
 # Image this file is written for: karmic-kraken r1 on our cu133 line
-# (build-kk-r1-cu133.env: vllm dev/karmic-kraken @ af9e4dc, b12x master @
-# 0f3a8cbfd -- the karmic-kraken CHANNEL assembly karmic-kraken-20260920-919cdcb9,
-# digest sha256:6988c9d7...). NOT the beta assembly (integration branches
-# 57a8098/e9ce547) -- that is a different line lacking the r1 startup
-# rank-coordination fix and carrying the beta-only memory commits.
+# (build-kk-r1-cu133.env: vllm integration/karmic-kraken-beta @ 57a8098,
+# b12x @ e9ce547 -- the published karmic-kraken-beta-20260920 assembly).
 # Values marked (measured) come from this pair's benchmarks ON JOVIAN-JUDGEMENT
 # and must be re-measured on KK before republishing. Values marked (published)
 # are the qualified GLM profile/preset in blackwell-llm-docker runtime/ (RTX
@@ -96,6 +93,8 @@ SPECULATOR=mtp
 
 # Draft depth. mtp: 3 is the qualified depth and (measured) the best static
 # depth here; 5 adaptive settled at 2.1-2.4 accepted. dflash2: 7 = its block.
+# (The HF catalog's base-model default is mtp tokens 5; the published KK
+# Spark preset and the upstream launcher default are 3 -- ours is 3, measured.)
 NUM_SPECULATIVE_TOKENS=3
 
 # Adaptive MTP depth (mtp only): 1 lets the engine adjust depth between 1
@@ -115,11 +114,17 @@ ADAPTIVE_SPECULATIVE_TOKENS_WINDOW=32
 DFLASH_MODEL_HOST_PATH=
 DFLASH_WEIGHTS_SHA256=
 DFLASH_KV_CACHE_DTYPE=auto
-# MTP head backends (mtp only). [KK] b12x / B12X is the published Spark TP2
-# preset and Luke's GB10 launcher (humming was the JJ default; the published
-# KK images do not ship humming-kernels at all, our overlay still installs
-# it). marlin = the published TP4 profile default. Other value: auto.
-MTP_MOE_BACKEND=b12x
+# MTP head backends (mtp only). The MoE backend follows the DRAFT experts'
+# format, not the target's:
+#   original GLM-5.3-Flash-NVFP4 (this file): MTP experts are MXFP8 ->
+#     marlin (the published KK profile for this checkpoint) or humming (the
+#     JJ default, measured on this pair). b12x boots the target and then dies
+#     in the draft constructor -- "moe_backend='b12x' is not supported for
+#     MXFP8 MoE" (measured 2026-09-21).
+#   GLM-5.3-Flash-NVFP4-Spark: MTP experts are NVFP4 -> b12x (the published
+#     Spark TP2 preset, Luke's GB10 launcher).
+# Attention: B12X for both. Other MoE value: auto.
+MTP_MOE_BACKEND=marlin
 MTP_ATTENTION_BACKEND=B12X
 
 # Draft sampling. [KK, published] probabilistic proposals + standard rejection
@@ -130,6 +135,19 @@ MTP_ATTENTION_BACKEND=B12X
 # both; the launcher emits whichever is set. Other rejection: block, synthetic.
 DRAFT_SAMPLE_METHOD=probabilistic
 REJECTION_SAMPLE_METHOD=standard
+
+# Speculative recurrent-state recovery (KK #821). AUTO-ON at karmic-kraken
+# for GLM5Next + MTP/DFlash (<=7 draft tokens) + BF16 + V2 runner +
+# mamba-cache-mode align + FP32/auto state dtype: instead of retaining full
+# speculative KDA states per draft position, the engine commits the accepted
+# state via b12x native CuTe recovery kernels and replays it on rollback
+# (the Kimi-K3 RecoverSSM pattern). Saves ~188 MiB/GPU reservation on TP2
+# MTP3; upstream TP4 measured -3.1% C1 / -1.8% C8 / -0.3% prefill. Empty =
+# auto (published behavior, what the first KK boot runs); 0 = emit
+# --no-use-replayssm (retain full speculative states = the JJ-era contract,
+# the A/B lever); 1 = emit --use-replayssm explicitly. NOT an env var the
+# engine reads -- the launcher turns it into the CLI flag.
+REPLAYSSM=
 
 # DFlash2 draft attention (dflash2 only). [KK] Empty = engine default; the
 # published DFlash2 profile pins FLASH_ATTN. Other values: B12X, auto.
@@ -209,16 +227,32 @@ BLOCK_SIZE=256
 # 3. MEMORY
 # =============================================================================
 
-# Pinned KV+recurrent pool in bytes. Bypasses profiling and makes
-# GPU_MEMORY_UTILIZATION inert. 9 GiB on the original NVFP4 = 1,087,023
+# Pinned KV+recurrent pool in bytes. Bypasses pool PROFILING (pool sizing
+# comes from the pin) but does NOT make GPU_MEMORY_UTILIZATION inert: the
+# worker's request_memory() gate still refuses to start when
+# CUDA-free-at-init < total x utilization (JJ and KK alike). 9 GiB on the
+# original NVFP4 = 1,087,023
 # tokens (~120k tokens per GiB); node static ~113 GiB + pin fully resident
 # + ~2.5 GiB prefill transient must stay under 121.7. Measured hovering at
 # 115.9 under bench (the pool fills only under long multi-user load).
+# VENDOR CONTEXT (lil.yaml, Luke's catalog for this checkpoint): his local
+# TP2 override runs budget 2048 + KV 2G and capacity max_num_seqs 4 --
+# far below this bench config (4096 / 9 GiB / 8 seqs). Ours are the
+# (measured) pair-bench values; treat the catalog numbers as the vendor
+# default, not the bench contract. KK delta #2/#3 changed pool admission
+# (#809: checkpoint/endpoint blocks now reserved, unrestorable pools
+# REJECTED at startup) -- re-derive this pin at the first KK boot; the
+# -1 auto-fit (MAX_MODEL_LEN) is the tool for reading the fitted capacity.
 KV_CACHE_MEMORY_BYTES=9771050598
 
-# Inert while the pin is set; governs pool sizing only if the pin is removed
-# (then GB10 refuses > ~0.913; page cache counts against CUDA free memory).
-#GPU_MEMORY_UTILIZATION=0.90
+# NOT inert with the pin: vLLM's request_memory() gate refuses to start when
+# CUDA-free-at-init < total x this value, pin or no pin; the pin only sizes
+# the pool. cu132 images: ceiling ~0.913 (page cache counts against CUDA free
+# memory). cu133 images (NGC foundation: r35-cu133, karmic-kraken): CUDA init
+# reserves ~13 GiB more -- measured 2026-09-21 host MemFree 117.5 GiB, CUDA
+# free 108.5/121.69 at the gate; 0.90 (109.5 GiB) refused, 0.85 is the
+# qualified value on this line. Without the pin it also drives profiling.
+GPU_MEMORY_UTILIZATION=0.85
 
 # fp8 is the qualified KV layout for B12X attention (engine selects the
 # fp8_ds_mla format). r26 adds nvfp4_ds_mla (half the bytes; quality-gated).
@@ -321,7 +355,9 @@ QUANTIZATION=modelopt_mixed
 # flashkda = the in-tree extension every JJ measurement here used (still
 # built; probe-image.sh checks _flashkda_C) -- the fallback if b12x misbehaves
 # on our image. auto falls back to Triton silently if an extension is missing.
-# Other values: triton, flashinfer.
+# Other values: triton, flashinfer. KK delta #3: block-FP8/WO capacity plans
+# now prepare BEFORE serving and unprepared execution is rejected
+# (cff8aebfeb + b12x 0332cc50) -- the preparation contract tightened again.
 KDA_PREFILL_BACKEND=b12x
 
 # KDA (GDN) decode kernel. Empty = the engine resolver (B12X live-tensor
@@ -356,28 +392,27 @@ B12X_AUTOTUNE=1
 # b12x 5c50b15 tuning decisions are keyed by CUDA device NAME, not UUID, so a
 # warm cache from one Spark is valid on the other -- and a warm cache on both
 # ranks removes the cold-JIT timing skew behind the rank-divergent startup
-# hang. COMPILE_WORKERS: b12x reads this one (default 8) as the SESSION
-# default; Luke's GB10 launchers run the split 16/16/4. The split names ARE
-# read on r1 -- by vLLM, not b12x: vllm/model_executor/warmup/b12x_prepare.py:512
-# does os.environ.get(f"B12X_{stage.upper()}_COMPILE_WORKERS") per stage, and
-# an unset stage falls back to B12X_COMPILE_WORKERS (so leaving them out means
-# bind also runs 16 workers instead of 4 -- boot-time contention on the
-# 20-core Grace, harmless otherwise). Uncomment to match Luke's validated
-# 16/16/4 exactly.
-#B12X_WEIGHTS_COMPILE_WORKERS=16
-#B12X_STATE_COMPILE_WORKERS=16
-#B12X_BIND_COMPILE_WORKERS=4
+# hang. COMPILE_WORKERS: b12x reads this one (default 8); Luke's GB10
+# launchers run 16 on the 20-core Grace (WEIGHTS/STATE/BIND_COMPILE_WORKERS
+# are launcher-side names, not read by b12x e9ce547 -- leave them out).
 B12X_COMPILE_CACHE_DIR=/cache/jit/b12x/compile
 B12X_COMPILE_WORKERS=16
 
 # Vocabulary heads. [KK, published] The GLM profile's contract is "BF16
-# target verifier; private NVFP4 MTP proposal copy":
-#   VLLM_GLM53_MTP_DRAFT_HEAD (new; bf16|nvfp4): storage/compute format of
-#     the independent GLM-5.3 MTP proposal head -- "the target vocabulary
-#     head and verifier remain BF16 in every mode" (envs.py). This is the
-#     KK lever for the draft head; published: nvfp4.
-#   VLLM_MTP_NVFP4_LM_HEAD (engine default 1): the older draft-copy switch;
-#     the published profile sets 0 alongside DRAFT_HEAD=nvfp4.
+# target verifier; private NVFP4 MTP proposal copy". There are TWO ways to
+# get the private NVFP4 draft head, and only one works on GB10:
+#   VLLM_GLM53_MTP_DRAFT_HEAD (new; bf16|nvfp4): nvfp4 = quantize a copy of
+#     the target's BF16 head at load and run it through FlashInfer's W4A16
+#     CuTe-DSL GEMM. mtp_draft_head.py hard-checks get_device_capability()
+#     == (12, 0); GB10 is 12.1 and the draft load raises "requires CUDA
+#     capability 12.0; got 12.1" (measured 2026-09-21). Published RTX
+#     profile: nvfp4. GB10: bf16 (engine default; the launcher dies on nvfp4).
+#   VLLM_MTP_NVFP4_LM_HEAD (engine default 1): the older switch -- the MTP
+#     layer loads the checkpoint's own NVFP4 lm_head (modelopt path, no
+#     capability gate). This is what Luke's GB10 launcher
+#     (scripts/serve-glm53-flash-nvfp4-tp2-rdma.sh) runs and what our JJ
+#     measurements used. Published RTX profile sets 0 because DRAFT_HEAD=nvfp4
+#     replaces it; on GB10 keep 1.
 #   VLLM_MXFP8_LM_HEAD (engine default 0): quantize the TARGET head (MXFP8).
 #     Our JJ measurement: +17% single-stream on TP2 GB10 (28.5 -> 33.4 tok/s)
 #     with a long-context JSON-copying regression under investigation;
@@ -385,11 +420,18 @@ B12X_COMPILE_WORKERS=16
 #   VLLM_LM_HEAD_A16 (default 1): BF16 activations for a quantized head.
 #   VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH (default 1): share KDA metadata
 #     across layers per step.
-VLLM_GLM53_MTP_DRAFT_HEAD=nvfp4
-VLLM_MTP_NVFP4_LM_HEAD=0
+VLLM_GLM53_MTP_DRAFT_HEAD=bf16
+VLLM_MTP_NVFP4_LM_HEAD=1
 VLLM_MXFP8_LM_HEAD=0
 VLLM_LM_HEAD_A16=1
 VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH=1
+
+# Recurrent-state layout for the aligned mamba/KDA state cache. [KK]
+# Registered envs.py key (Literal["SD","DS"], choices-validated -- NEVER
+# leave the value empty). DS is what Luke's GB10 launcher, the HF catalog
+# (lil.yaml environment:) and the eugr Spark recipe all set; SD is the
+# engine default when unset.
+VLLM_SSM_CONV_STATE_LAYOUT=DS
 
 # [KK, published] The rest of the GLM model-profile environment from
 # blackwell-llm-docker runtime/profiles/glm53-flash.yaml, verbatim (RTX
@@ -404,7 +446,12 @@ B12X_DYNAMIC_SPLIT_FAST_PREPARE=1
 B12X_DYNAMIC_WORK_SOURCE=persistent_grid
 B12X_DYNAMIC_SPLIT_COMPUTE_MAC=224
 B12X_MHC_PDL=1
-VLLM_GLM53_L2_PREFETCH=1
+# L2 prefetch: l2_prefetch.py enables itself only on capability (12, 0); =1
+# forces it on GB10 (12.1). The policy is sized for the 128 MB L2 of the RTX
+# PRO 6000; Luke's GB10 launcher leaves it unset (off). It ran without error
+# on the 2026-09-21 boot ("L2 prefetch honoured"), so it is a measured A/B,
+# not part of the baseline: leave commented until there is a tok/s baseline.
+#VLLM_GLM53_L2_PREFETCH=1
 VLLM_GLM53_L2_PREFETCH_PERSIST_MB=0
 VLLM_GLM53_DFLASH_ATTN=1
 VLLM_CAUSAL_CONV1D_UPDATE_HOIST=1
@@ -424,6 +471,16 @@ VLLM_USE_V2_MODEL_RUNNER=1
 # vLLM custom ops, so the expected gain is small; compile time on Grace is
 # minutes. A/B only.
 COMPILATION_LEVEL=
+
+# AOT compilation artifacts (KK; registered, default False; Luke's GB10
+# launcher AND the eugr Spark recipe run both on). Boot-time lever, not a
+# throughput one: precompiles/warms the compile artifacts. CAUTION:
+# MEGA_AOT_ARTIFACT=1 hard-requires VLLM_USE_STANDALONE_COMPILE=1
+# (vllm/compilation/backends.py:97 assert). A/B only -- JJ expectations were
+# a small serving gain; boot-time saving unmeasured on the pair.
+#VLLM_USE_AOT_COMPILE=1
+#VLLM_USE_MEGA_AOT_ARTIFACT=1
+#VLLM_USE_STANDALONE_COMPILE=1
 
 # Sampling defaults: auto = the checkpoint's generation_config.json (what
 # every benchmark here ran under); vllm = engine-neutral defaults (T=1, no
@@ -490,7 +547,9 @@ VLLM_GLM53_SPLIT_MAMBA_BLOCK_SIZE=256
 # (measured) decode unchanged versus NCCL at TP2 (2 MiB cutoff); raising the
 # cutoff to 16 MiB puts the 4096-token prefill chunk's per-layer reduce
 # (4096 x 2048 x 2 B = 16 MiB exactly) on RoCE: prefill 8k +19%, 32k-128k
-# +1-4%. Dooner's TP2 profile uses the same value. 0 = NCCL for everything.
+# +1-4%. Dooner's TP2 profile uses the same value. Luke's launcher and the
+# eugr Spark recipe both still run 2MB -- our 16 MiB remains the measured
+# outlier; standing send-Luke item. 0 = NCCL for everything.
 # The proxy compiles at first boot into B12X_ROCE_CACHE_DIR (keep under
 # /cache). HCA and GID fall back to NCCL_IB_HCA / NCCL_IB_GID_INDEX.
 # [R17-RoCE / head images; the R12 image ignores these]
@@ -522,7 +581,9 @@ LOAD_FORMAT=instanttensor
 # InstantTensor-ONLY staging bounds (read by the instanttensor library; inert
 # under b12x/fastsafetensors/auto -- the launcher passes them only when
 # LOAD_FORMAT=instanttensor). BUFFER_SIZE 1.25 GiB covers the largest tensor
-# (1,268,776,960 B); 64 MiB just got auto-enlarged every boot. COPY: auto =
+# (1,268,776,960 B); 64 MiB just got auto-enlarged every boot. (The eugr
+# Spark recipe runs 64 MiB -- fine for the -Spark checkpoint whose tensors
+# are smaller; OUR checkpoint needs the 1.25 GiB cover.) COPY: auto =
 # engine default; 0 passes instanttensor_copy:false (bounded unified-memory
 # loading, upstream's TP2 setting) [head-0903+]; 1 forces copies.
 INSTANTTENSOR_BUFFER_SIZE=1342177280
@@ -550,27 +611,36 @@ VLLM_WORKER_MULTIPROC_METHOD=spawn
 # The paths are IMAGE-FLAVOR specific; exactly one block is active. The
 # launcher verifies every LD_PRELOAD path exists inside the image at --check.
 #
-# cu133 images (build-spark-cu133.sh, incl. karmic-kraken-r1-cu133:
-# NGC-based foundation, NCCL 2.31.2 at /opt/local-inference/nccl/lib; the
-# image bakes these NCCL values itself). The NGC base ships its
-# forward-compat libcuda under /usr/local/cuda/compat/lib.real/ -- confirm:
-#   docker run --rm --entrypoint ls <image> /usr/local/cuda/compat/lib.real
-# and drop the shim from LD_PRELOAD if the host driver already satisfies
-# CUDA 13.3 (then the plain NCCL preload is enough). ACTIVE BLOCK:
-LD_PRELOAD=/usr/local/cuda/compat/lib.real/libcuda.so.1:/opt/local-inference/nccl/lib/libnccl.so.2.31.2
-VLLM_NCCL_SO_PATH=/opt/local-inference/nccl/lib/libnccl.so.2.31.2
-NCCL_LOCAL_INFERENCE_PATH=/opt/local-inference/nccl/lib/libnccl.so.2.31.2
-NCCL_PR2127_PATH=/opt/local-inference/nccl/lib/libnccl.so.2.31.2
+# cu132 images (build-spark-cu132.sh, incl. karmic-kraken-beta-cu132:
+# CUDA 13.2, NCCL 2.30.4 at /opt/libnccl-local-inference.so.2.30.4).
+# ACTIVE BLOCK -- and cu132 DOES need its compat shim on the 580 driver
+# (13.2 calls a driver entry point 580 lacks: "undefined symbol:
+# cuTensorMapEncodeTiled"), unlike cu133 below.
+LD_PRELOAD=/usr/local/cuda/compat/libcuda.so.1:/opt/libnccl-local-inference.so.2.30.4
+VLLM_NCCL_SO_PATH=/opt/libnccl-local-inference.so.2.30.4
+NCCL_LOCAL_INFERENCE_PATH=/opt/libnccl-local-inference.so.2.30.4
+NCCL_PR2127_PATH=/opt/libnccl-local-inference.so.2.30.4
 #
-# cu132 images (build-spark-cu132.sh: R12 .. R35 on CUDA 13.2, NCCL 2.30.4):
-#LD_PRELOAD=/usr/local/cuda/compat/libcuda.so.1:/opt/libnccl-local-inference.so.2.30.4
-#VLLM_NCCL_SO_PATH=/opt/libnccl-local-inference.so.2.30.4
-#NCCL_LOCAL_INFERENCE_PATH=/opt/libnccl-local-inference.so.2.30.4
-#NCCL_PR2127_PATH=/opt/libnccl-local-inference.so.2.30.4
+# cu133 images (build-spark-cu133.sh: NGC-based foundation, NCCL 2.31.2 at
+# /opt/local-inference/nccl/lib). SHELVED (2026-09-23, operator): until
+# NVIDIA updates the Spark drivers for cu133. MEASURED 2026-09-21 when it
+# was still on the table: host driver 580.173.02 runs the CUDA 13.3 toolkit
+# under minor-version compatibility (torch.cuda init, vllm and b12x import
+# fine with the NCCL-only preload below) -- but preloading the NGC 26.07
+# forward-compat libcuda (/usr/local/cuda/compat/lib.real/, R610.43.02)
+# kills every process silently during torch's driver init -- GB10 is not on
+# the forward-compat supported list and the failure is a crash, not an error
+# code. The path exists in the image, so --check cannot catch it; the
+# launcher warns on it. When cu133 reopens: NCCL-only preload, NEVER the
+# compat shim.
+#LD_PRELOAD=/opt/local-inference/nccl/lib/libnccl.so.2.31.2
+#VLLM_NCCL_SO_PATH=/opt/local-inference/nccl/lib/libnccl.so.2.31.2
+#NCCL_LOCAL_INFERENCE_PATH=/opt/local-inference/nccl/lib/libnccl.so.2.31.2
+#NCCL_PR2127_PATH=/opt/local-inference/nccl/lib/libnccl.so.2.31.2
 
 TORCH_USE_RTLD_GLOBAL=1
 
-# JIT toolchain: Triton uses the image's CUDA ptxas (13.3 on this line), not its bundled one.
+# JIT toolchain: Triton uses the image's CUDA ptxas (13.2 on this line), not its bundled one.
 CUDA_HOME=/usr/local/cuda
 TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
 
@@ -595,13 +665,20 @@ CONTAINER_RUNTIME=docker
 # NCCL_IB_DISABLE=1 for single-node boxes; this overrides it.
 NCCL_NET=IB
 NCCL_NET_PLUGIN=none
+NCCL_TUNER_PLUGIN=none
 NCCL_IB_DISABLE=0
 
-# Single-rail profile (validated): 0/0. Dual-rail (both CX7 ports cabled):
-# MERGE_NICS=1 + SUBNET_AWARE_ROUTING=1 + both rails in NCCL_IB_HCA for
-# ~2x cross-node bandwidth; the launcher rejects mixed settings. Upstream's
-# single-rail launcher runs SUBNET_AWARE_ROUTING=1 with MERGE_NICS=0
-# (allowed, warned, unmeasured here).
+# Fabric profiles (measured 2026-09-21, Luke's launchers):
+#   single-path (validated on this pair): MERGE_NICS=0, one HCA in
+#     NCCL_IB_HCA, one cable.
+#   dual-path (Luke's Spark launchers): MERGE_NICS=1 with BOTH Linux
+#     interfaces of the cabled port in NCCL_IB_HCA (rocep1s0f0,roceP2p1s0f0)
+#     -- the two PCIe Gen5 x4 paths into the SAME CX-7, not a second cable:
+#     one 200G link striped over both PCIe paths (196 Gb/s combined vs the
+#     single-path cap). The second interface needs its own IPv4 (own /24) so
+#     the GID index is populated on both; RoCEnante picks up to two HCAs.
+#     SUBNET_AWARE_ROUTING is no longer part of that profile (dropped
+#     upstream at 9e5d179); it only matters behind a switch.
 NCCL_IB_SUBNET_AWARE_ROUTING=0
 NCCL_IB_MERGE_NICS=0
 

@@ -7,8 +7,9 @@
 #
 # TARGET STACK, not generic vLLM. This launcher assumes an aarch64/sm_121
 # image built by build-spark-cu132.sh from:
-#   - local-inference-lab/vllm, branch dev/jovian-judgement
-#   - local-inference-lab/sparkinfer (B12X) kernels
+#   - local-inference-lab/vllm, branch dev/karmic-kraken @ 57fdda71
+#   - local-inference-lab/b12x @ 8a99d639 (kk-beta-cu132 profile; kk-beta
+#     nomenclature until Luke confirms the r1 tag scheme)
 #   - the patched NCCL + CUDA compat shim that image carries
 # Many flags emitted below (--attention-backend B12X, --moe-backend b12x,
 # --linear-backend, --kda-prefill-backend, --gdn-decode-kernel,
@@ -134,6 +135,7 @@ model_defaults() {
   : "${TRUST_REMOTE_CODE:=1}"                # deepseek_v4 tokenizer/config classes
   : "${ENABLE_FLASHINFER_AUTOTUNE:=1}"       # upstream DSV4 recipes pass --enable-flashinfer-autotune
   : "${DSPARK_DRAFT_SAMPLE_METHOD:=probabilistic}"  # HF card + upstream; greedy one-hots the draft, which starves adaptive verification
+  : "${DSPARK_REJECTION_SAMPLE_METHOD:=standard}"  # KK published contract (probabilistic + standard); other values: block, synthetic
   : "${DSPARK_ADAPTIVE_VERIFICATION:=1}"     # HF card: enable_adaptive_verification true; B12X DSV4 backends support device-trimmed verification
   : "${DEEPSEEK_THINKING:=true}"             # chat-template kwarg defaults, per-request values win
   : "${DEEPSEEK_REASONING_EFFORT:=high}"
@@ -178,6 +180,10 @@ model_validate() {
   case "$DSPARK_DRAFT_SAMPLE_METHOD" in
     greedy|probabilistic) : ;;
     *) die "DSPARK_DRAFT_SAMPLE_METHOD must be greedy or probabilistic: $DSPARK_DRAFT_SAMPLE_METHOD" ;;
+  esac
+  case "$DSPARK_REJECTION_SAMPLE_METHOD" in
+    standard|block|synthetic) : ;;
+    *) die "DSPARK_REJECTION_SAMPLE_METHOD must be standard, block, or synthetic: $DSPARK_REJECTION_SAMPLE_METHOD" ;;
   esac
   case "$DEEPSEEK_THINKING" in
     true|false) : ;;
@@ -228,8 +234,10 @@ model_speculative_config() {
   [ "$DSPARK_ADAPTIVE_VERIFICATION" = 1 ] && adaptive=true
   case "$SPECULATOR" in
     dspark)
-      printf '{"method":"dspark","num_speculative_tokens":%s,"draft_sample_method":"%s","enable_adaptive_verification":%s}' \
-        "$NUM_SPECULATIVE_TOKENS" "$DSPARK_DRAFT_SAMPLE_METHOD" "$adaptive" ;;
+      # KK published contract: probabilistic proposals + standard rejection
+      # (the ds4-vision profile emits both; rejection default is standard).
+      printf '{"method":"dspark","num_speculative_tokens":%s,"draft_sample_method":"%s","rejection_sample_method":"%s","enable_adaptive_verification":%s}' \
+        "$NUM_SPECULATIVE_TOKENS" "$DSPARK_DRAFT_SAMPLE_METHOD" "$DSPARK_REJECTION_SAMPLE_METHOD" "$adaptive" ;;
     *) die "model_speculative_config: no JSON defined for SPECULATOR=$SPECULATOR" ;;
   esac
 }
@@ -400,7 +408,7 @@ fi
 # (VLLM_PREFIX_CACHE_RETENTION_INTERVAL= crashed argparse with int('') on
 # 2026-09-11). Refuse an empty value for any key the launcher does not consume.
 # Models extend the allow-list via MODEL_EMPTY_OK_KEYS (space-separated).
-LAUNCHER_EMPTY_OK_KEYS="API_KEY DRAFT_MODEL_HOST_PATH DRAFT_WEIGHTS_SHA256 KV_CACHE_MEMORY_BYTES CONTAINER_MEMORY_GB CONTAINER_NAME_SUFFIX PREFILL_SCHEDULE_INTERVAL FAIRNESS_ENGINE PREFILL_COMPUTE_SHARE RECURRENT_CHECKPOINT_POLICY KDA_PREFILL_BACKEND GDN_DECODE_KERNEL COMPILATION_LEVEL SAMPLING_TEMPERATURE SAMPLING_TOP_P SAMPLING_TOP_K SAMPLING_MIN_P SAMPLING_REPETITION_PENALTY MM_PROCESSOR_CACHE_GB MM_ENCODER_TP_MODE CHAT_TEMPLATE_HOST_PATH TORCH_PROFILE_HOST_DIR VLLM_PLUGINS"
+LAUNCHER_EMPTY_OK_KEYS="API_KEY DRAFT_MODEL_HOST_PATH DRAFT_WEIGHTS_SHA256 KV_CACHE_MEMORY_BYTES CONTAINER_MEMORY_GB CONTAINER_NAME_SUFFIX PREFILL_SCHEDULE_INTERVAL FAIRNESS_ENGINE PREFILL_COMPUTE_SHARE RECURRENT_CHECKPOINT_POLICY KDA_PREFILL_BACKEND GDN_DECODE_KERNEL PREFIX_RETENTION_INTERVAL ASYNC_SCHEDULING DSPARK_REJECTION_SAMPLE_METHOD COMPILATION_LEVEL SAMPLING_TEMPERATURE SAMPLING_TOP_P SAMPLING_TOP_K SAMPLING_MIN_P SAMPLING_REPETITION_PENALTY MM_PROCESSOR_CACHE_GB MM_ENCODER_TP_MODE CHAT_TEMPLATE_HOST_PATH TORCH_PROFILE_HOST_DIR VLLM_PLUGINS"
 empty_bad=""
 for k in $(grep -Eo '^[[:space:]]*[A-Z][A-Z0-9_]*=[[:space:]]*$' "$env_file" | tr -d ' ='); do
   case " ${LAUNCHER_EMPTY_OK_KEYS} ${MODEL_EMPTY_OK_KEYS:-} " in
@@ -583,7 +591,7 @@ model_defaults   # hook: model fallbacks
 : "${KV_CACHE_MEMORY_BYTES:=}"               # empty = vLLM profiles at GPU_MEMORY_UTILIZATION
 : "${ENABLE_PREFIX_CACHING:=1}"
 : "${ENABLE_CHUNKED_PREFILL:=1}"
-: "${SERVING_IMAGE:=}"                       # required: image tag or digest present on BOTH nodes
+: "${SERVING_IMAGE:=local/vllm:karmic-kraken-beta-cu132}"  # empty = required; tag or digest present on BOTH nodes
 : "${MEM_PREFLIGHT:=die}"                    # die | warn | off -- host free-memory gate below
 : "${FABRIC_PROFILE:=single}"                # single | dual -- see the fabric checks below
 # Scheduler/loader/profiling knobs. All default to "omit the flag" so the
@@ -634,7 +642,7 @@ for name in \
   VLLM_HOST_IP NCCL_NET NCCL_NET_PLUGIN NCCL_IB_DISABLE NCCL_IB_HCA \
   NCCL_IB_GID_INDEX NCCL_IB_SUBNET_AWARE_ROUTING NCCL_IB_MERGE_NICS \
   NCCL_PROTO NCCL_P2P_LEVEL NCCL_CROSS_NIC NCCL_CUMEM_ENABLE \
-  NCCL_IGNORE_CPU_AFFINITY CUTE_DSL_ARCH VLLM_ENABLE_PCIE_ALLREDUCE; do
+  NCCL_IGNORE_CPU_AFFINITY NCCL_TUNER_PLUGIN CUTE_DSL_ARCH VLLM_ENABLE_PCIE_ALLREDUCE; do
   require_value "$name"
 done
 
@@ -847,6 +855,7 @@ model_validate   # hook: model-specific keys and known-bad combinations
   || die "NCCL_SOCKET_IFNAME and GLOO_SOCKET_IFNAME must match on a pair"
 [ "$NCCL_NET" = IB ] || die "NCCL_NET must be IB (RoCE presents IB semantics over Ethernet)"
 [ "$NCCL_NET_PLUGIN" = none ] || die "NCCL_NET_PLUGIN must be none"
+[ "$NCCL_TUNER_PLUGIN" = none ] || die "NCCL_TUNER_PLUGIN must be none (no tuner plugin ships in the image; the published preset and Luke's launcher both pin none)"
 [ "$NCCL_IB_DISABLE" = 0 ] || die "NCCL_IB_DISABLE must be 0 (the image bakes 1 for single-node use; override it in the env file or the pair silently falls back to TCP)"
 # FABRIC_PROFILE selects the cabling, and the launcher then enforces every
 # knob that follows from it. It is named explicitly rather than inferred from
@@ -1031,6 +1040,8 @@ compilation_config=$(printf '{"cudagraph_mode":"%s","custom_ops":["all"]%s}' \
 chat_template_container_path=/models/chat_template.jinja
 extra_args=()
 [ -z "$PREFILL_SCHEDULE_INTERVAL" ] || extra_args+=(--prefill-schedule-interval "$PREFILL_SCHEDULE_INTERVAL")
+[ "$ASYNC_SCHEDULING" = 1 ] && extra_args+=(--async-scheduling)
+[ -z "$PREFIX_RETENTION_INTERVAL" ] || extra_args+=(--prefix-cache-retention-interval "$PREFIX_RETENTION_INTERVAL")
 case "$INSTANTTENSOR_COPY" in
   auto) ;;
   0) extra_args+=(--model-loader-extra-config '{"instanttensor_copy":false}') ;;
