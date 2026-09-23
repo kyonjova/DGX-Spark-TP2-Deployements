@@ -181,7 +181,7 @@ ITEMS=("${models[@]}")
 pick_from_list "Which model directory?" "${ITEMS[@]}"
 model=${ITEMS[pick - 1]}
 model_dir=$deployments_root/$model
-env_examples=("$model_dir"/*-rank.env.example)
+env_examples=("$model_dir"/*_rank.env.example)
 pair_serves=("$model_dir"/*_pair_serve.sh)
 shopt -u nullglob
 (( ${#env_examples[@]} > 0 )) || die "no *-rank.env.example in $model_dir"
