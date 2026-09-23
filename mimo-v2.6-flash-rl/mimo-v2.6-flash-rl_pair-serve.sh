@@ -14,10 +14,10 @@
 # (MiMo checkpoint + auxiliary-state loading lives in it -- de16d74135,
 # 308fb7204f; the catalog's load_format: b12x). The loader reads weights
 # through an O_DIRECT io_uring ring (b12x 1ec67ef6), which needs
-# io_uring_setup/enter/register in the container seccomp: this launcher ships
-# seccomp-io-uring.json (Moby default + the three syscalls, from vLLM
-# scripts/seccomp/spark-io-uring.json) and probes io_uring inside the image
-# at --check, dying with an actionable message if blocked.
+# io_uring_setup/enter/register in the container seccomp: the launcher passes
+# the SHARED ../seccomp-io-uring.json at the deployments root (Moby default +
+# the three syscalls = vLLM scripts/seccomp/spark-io-uring.json) and probes
+# io_uring inside the image at --check (shared block before command=()).
 #
 # GROUNDWORK STATUS: the catalog qualifies MiMo at TP4 on SM120 (sm_120a)
 # ONLY; GB10/sm_121a is unqualified territory -- expect kernel surprises and
@@ -44,7 +44,7 @@
 
 set -euo pipefail
 
-# Directory of this script: relative SECCOMP_PROFILE paths resolve here.
+# Directory of this script: the shared seccomp profile resolves from here.
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
@@ -359,7 +359,6 @@ require_unit_fraction() {
 : "${CONTAINER_MEMORY_GB:=}"           # cgroup cap so a runaway load cannot OOM the host
 : "${ASYNC_SCHEDULING:=}"              # 1 = --async-scheduling (NOT in the MiMo catalog contract; A/B)
 : "${PREFIX_RETENTION_INTERVAL:=}"     # --prefix-cache-retention-interval N (SWA checkpoints; NOT catalog-qualified for MiMo; block-size multiple)
-: "${SECCOMP_PROFILE:=}"               # REQUIRED for the b12x loader's io_uring ring: empty = runtime default seccomp (probe below dies if blocked); a PATH = --security-opt seccomp=<path>; unconfined = last resort. The shipped seccomp-io-uring.json is the target
 : "${VLLM_KV_CACHE_LAYOUT:=}"          # empty = engine auto; BLHNC (block-outermost) is required ONLY when mixing draft+target page sizes (DFlash A/B; fc27214ba9)
 # TP=2 InstantTensor staging bounds (inert under the b12x loader; only passed
 # when instanttensor is selected).
@@ -409,15 +408,6 @@ esac
 case "$COMPILATION_LEVEL" in ""|0|1|2|3) : ;; *) die "COMPILATION_LEVEL must be empty or 0-3: $COMPILATION_LEVEL" ;; esac
 case "$GENERATION_CONFIG" in auto|vllm) : ;; *) die "GENERATION_CONFIG must be auto or vllm: $GENERATION_CONFIG" ;; esac
 [ -z "$FAIRNESS_ENGINE" ] || die "FAIRNESS_ENGINE=$FAIRNESS_ENGINE: --fairness-engine no longer exists on karmic-kraken; remove it and set PREFILL_COMPUTE_SHARE alone (with PREFILL_SCHEDULE_INTERVAL=1)"
-seccomp_opt=""
-case "$SECCOMP_PROFILE" in
-  "") : ;;
-  unconfined) seccomp_opt=unconfined ;;
-  /*) [ -f "$SECCOMP_PROFILE" ] || die "SECCOMP_PROFILE does not exist: $SECCOMP_PROFILE"; seccomp_opt=$SECCOMP_PROFILE ;;
-  *) if [ -f "$SCRIPT_DIR/$SECCOMP_PROFILE" ]; then seccomp_opt=$SCRIPT_DIR/$SECCOMP_PROFILE
-     elif [ -f "$SECCOMP_PROFILE" ]; then seccomp_opt=$(cd "$(dirname "$SECCOMP_PROFILE")" && pwd)/$(basename "$SECCOMP_PROFILE")
-     else die "SECCOMP_PROFILE does not exist: $SECCOMP_PROFILE (looked in $SCRIPT_DIR and the current directory)"; fi ;;
-esac
 case "$MAX_PARALLEL_PREFILLS" in ""|auto) : ;; *) require_positive_integer MAX_PARALLEL_PREFILLS ;; esac
 case "$LOAD_FORMAT" in
   instanttensor|fastsafetensors|auto|safetensors) : ;;
@@ -801,37 +791,6 @@ if [ "${SKIP_IMAGE_PRELOAD_CHECK:-0}" != 1 ] \
     || die "LD_PRELOAD names path(s) absent from the image:$preload_missing -- every process in the container would fail at exec"
 fi
 
-# io_uring probe for the b12x loader: the loader reads weights through an
-# O_DIRECT io_uring ring (b12x 1ec67ef6); a blocked io_uring_setup (older
-# Docker / Podman default seccomp) fails deep in the load with EPERM and no
-# name. Probe it inside the image at --check and say the fix. io_uring_setup
-# is syscall 425 on x86_64 AND aarch64; with NULL params an allowed kernel
-# answers -EFAULT (bad params), seccomp answers -EPERM.
-if [ "$LOAD_FORMAT" = b12x ] \
-   && command -v "$CONTAINER_RUNTIME" >/dev/null 2>&1 \
-   && "$CONTAINER_RUNTIME" image inspect "$SERVING_IMAGE" >/dev/null 2>&1; then
-  seccomp_args=()
-  [ -z "$seccomp_opt" ] || seccomp_args=(--security-opt "seccomp=$seccomp_opt")
-  # The loader's Spark read path (read_mode auto -> "bounce" on unified
-  # memory) is compiled at first use against liburing; b12x's native build
-  # treats liburing as optional and, without it, bounce_create() fails with
-  # "io_uring bounce support is unavailable: install liburing development
-  # headers and pkg-config". The stock cu132 image has pkg-config but NOT
-  # liburing-dev -- check it here instead of 90 s into the load.
-  "$CONTAINER_RUNTIME" run --rm --entrypoint sh "$SERVING_IMAGE" -c 'pkg-config --exists liburing' >/dev/null 2>&1 \
-    || die "LOAD_FORMAT=b12x: $SERVING_IMAGE has no liburing development files, so the b12x loader's io_uring bounce reader cannot build (\"io_uring bounce support is unavailable\"). Build the derived image (Dockerfile.io-uring next to this launcher, apt liburing-dev) and point SERVING_IMAGE at it on BOTH nodes" 
-  probe_out="$("$CONTAINER_RUNTIME" run --rm "${seccomp_args[@]}" \
-    --entrypoint /opt/venv/bin/python "$SERVING_IMAGE" -c '
-import ctypes, errno
-libc = ctypes.CDLL(None, use_errno=True)
-libc.syscall(425, 0, 0)
-err = ctypes.get_errno()
-raise SystemExit("BLOCKED" if err == errno.EPERM else "OK")
-' 2>&1 || true)"
-  case "$probe_out" in
-    *BLOCKED*) die "io_uring is BLOCKED inside the container (EPERM) -- the b12x loader reads weights through an io_uring ring. Either the container seccomp blocks it (set SECCOMP_PROFILE=seccomp-io-uring.json, shipped next to this script; Docker >= 25's default profile drops io_uring) or the HOST disables it: check 'sysctl kernel.io_uring_disabled' (must be 0; 1 still refuses a container without CAP_SYS_ADMIN)" ;;
-  esac
-fi
 
 # ----------------------------------------------------------- launch command
 
@@ -967,6 +926,66 @@ if [ -n "$TORCH_PROFILE_HOST_DIR" ]; then
   mount_args+=(-v "$TORCH_PROFILE_HOST_DIR:/profiles")
 fi
 
+# ===== BEGIN shared block: b12x loader io_uring (identical in every *_pair-serve.sh) =====
+# LOAD_FORMAT=b12x reads weights through an O_DIRECT io_uring ring (b12x
+# 1ec67ef6). Three things must hold, and each fails differently:
+#   1. liburing in the IMAGE -- b12x builds the reader at first use and treats
+#      liburing as optional: "io_uring bounce support is unavailable".
+#      (build-spark-cu132.sh PATCH_IO_URING bakes it.)
+#   2. io_uring_setup/enter/register allowed by the CONTAINER seccomp. Docker
+#      >= 25's default profile blocks them, and an image cannot relax its own
+#      seccomp (the runtime installs the filter before the entrypoint), so the
+#      profile is passed from here: one shared copy at the deployments root.
+#   3. HOST sysctl kernel.io_uring_disabled=0.
+# SECCOMP_PROFILE (env file; usually left out):
+#   unset/empty = auto: with LOAD_FORMAT=b12x use <deployments>/seccomp-io-uring.json
+#                 (the parent of this script's folder); other loaders pass nothing
+#   <path>      = that profile (absolute, or relative to this script's folder)
+#   none        = pass nothing (the docker daemon default already allows io_uring)
+#   unconfined  = no syscall filtering at all (last resort)
+: "${SECCOMP_PROFILE:=}"
+: "${SCRIPT_DIR:=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}"
+seccomp_args=()
+seccomp_desc="runtime default"
+seccomp_path=""
+case "$SECCOMP_PROFILE" in
+  none) seccomp_desc="runtime default (SECCOMP_PROFILE=none)" ;;
+  unconfined)
+    seccomp_args=(--security-opt seccomp=unconfined); seccomp_desc=unconfined
+    warn "SECCOMP_PROFILE=unconfined disables syscall filtering for the whole container; prefer the shared seccomp-io-uring.json" ;;
+  "") [ "$LOAD_FORMAT" != b12x ] || seccomp_path="$SCRIPT_DIR/../seccomp-io-uring.json" ;;
+  /*) seccomp_path=$SECCOMP_PROFILE ;;
+  *)  seccomp_path="$SCRIPT_DIR/$SECCOMP_PROFILE" ;;
+esac
+if [ -n "$seccomp_path" ]; then
+  [ -f "$seccomp_path" ] || die "seccomp profile not found: $seccomp_path -- LOAD_FORMAT=b12x needs io_uring allowed in the container. Put the shared seccomp-io-uring.json in the deployments root ($(cd "$SCRIPT_DIR/.." && pwd)/), point SECCOMP_PROFILE at a copy, or set SECCOMP_PROFILE=none if the docker daemon default already allows io_uring"
+  seccomp_path="$(cd "$(dirname "$seccomp_path")" && pwd)/$(basename "$seccomp_path")"
+  for sc in io_uring_setup io_uring_enter io_uring_register; do
+    grep -q "\"$sc\"" "$seccomp_path" \
+      || die "seccomp profile $seccomp_path does not list $sc -- wrong file? (expected vllm scripts/seccomp/spark-io-uring.json)"
+  done
+  seccomp_args=(--security-opt "seccomp=$seccomp_path"); seccomp_desc=$seccomp_path
+fi
+# Probe the image with exactly the seccomp the serve container will get.
+# io_uring_setup is syscall 425 on aarch64 and x86_64; with NULL params an
+# allowed kernel answers EFAULT, a blocking seccomp (or sysctl) answers EPERM.
+if [ "$LOAD_FORMAT" = b12x ] \
+   && command -v "$CONTAINER_RUNTIME" >/dev/null 2>&1 \
+   && "$CONTAINER_RUNTIME" image inspect "$SERVING_IMAGE" >/dev/null 2>&1; then
+  "$CONTAINER_RUNTIME" run --rm --entrypoint sh "$SERVING_IMAGE" -c 'pkg-config --exists liburing' >/dev/null 2>&1 \
+    || die "LOAD_FORMAT=b12x: $SERVING_IMAGE has no liburing development files, so the b12x loader dies with \"io_uring bounce support is unavailable\". Rebuild with PATCH_IO_URING=on (build-spark-cu132.sh), or use LOAD_FORMAT=instanttensor"
+  uring_probe="$("$CONTAINER_RUNTIME" run --rm "${seccomp_args[@]}" --entrypoint /opt/venv/bin/python "$SERVING_IMAGE" -c '
+import ctypes, errno
+libc = ctypes.CDLL(None, use_errno=True); libc.syscall(425, 0, 0)
+print("BLOCKED" if ctypes.get_errno() == errno.EPERM else "OK")' 2>&1 || true)"
+  case "$uring_probe" in
+    *BLOCKED*) die "io_uring is BLOCKED in the container under seccomp '$seccomp_desc' (EPERM). Check the profile, and the host: sysctl kernel.io_uring_disabled must be 0" ;;
+    *OK*) ;;
+    *) warn "io_uring probe inconclusive (${uring_probe:-no output}); the load will tell" ;;
+  esac
+fi
+# ===== END shared block: b12x loader io_uring =====
+
 command=(
   "$CONTAINER_RUNTIME" run -d
   --name "$container_name"
@@ -978,7 +997,7 @@ command=(
   --ulimit memlock=-1:-1
   ${CONTAINER_MEMORY_GB:+--memory ${CONTAINER_MEMORY_GB}g --memory-swap $((${CONTAINER_MEMORY_GB:-0}+4))g}
   --device /dev/infiniband
-  ${seccomp_opt:+--security-opt "seccomp=$seccomp_opt"}
+  "${seccomp_args[@]}"   # b12x loader io_uring (shared block above)
   "${mount_args[@]}"
   --env-file "$env_file"
   # The image bakes VLLM_PCIE_ALLREDUCE_BACKEND=cpp (the pre-rename value).
@@ -1087,6 +1106,7 @@ fi
 printf '  CUDAGRAPH_MODE:          %s (capture %s)\n' \
   "$CUDAGRAPH_MODE" "$MAX_CUDAGRAPH_CAPTURE_SIZE"
 printf '  LOAD_FORMAT:             %s\n' "$LOAD_FORMAT"
+printf '  seccomp:                 %s\n' "$seccomp_desc"
 printf '  API_KEY:                 %s\n' "$([ -n "$API_KEY" ] && echo 'set (Bearer required)' || echo 'none (open port)')"
 printf '  command:'
 printf ' %q' "${command[@]}"

@@ -346,6 +346,16 @@ VLLM_ENABLE_PCIE_ALLREDUCE=0
 # the loader's storage mode has cost prefill on GB10).
 LOAD_FORMAT=instanttensor
 
+# Container seccomp for the b12x loader's io_uring ring. Leave this line
+# commented: with LOAD_FORMAT=b12x the launcher passes the SHARED profile at
+# the deployments root (../seccomp-io-uring.json, one copy for every model =
+# vllm scripts/seccomp/spark-io-uring.json) via --security-opt; other loaders
+# pass nothing. Override: a path (absolute or relative to the launcher's
+# folder), none (docker daemon default already allows io_uring), or
+# unconfined (last resort). --check probes io_uring inside the image with the
+# resolved profile and dies with the fix if it is blocked.
+#SECCOMP_PROFILE=../seccomp-io-uring.json
+
 # InstantTensor-ONLY staging bounds; inert under any other loader, and the
 # launcher passes them only when it is selected. BUFFER_SIZE must exceed the
 # checkpoint's largest tensor or the loader enlarges it on every boot (check
