@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # env-create.sh — interactively fill a model's rank env file from its
-# -rank.env.example, using a per-model profile under profiles/.
+# <stem>_rank.env.example, using a per-model profile under profiles/.
+#
+# Naming convention (per model directory, <stem> shared by both files):
+#   <model-dir>/<stem>_rank.env.example   e.g. glm-53-flash_rank.env.example
+#   <model-dir>/<stem>_pair-serve.sh      e.g. glm-53-flash_pair-serve.sh
 #
 # Usage:  ./env-create.sh
 #   1. pick the model directory
@@ -12,8 +16,8 @@
 #   6. writes deployments/<model>/rank-<rank>.env and runs the model's
 #      pair launcher --check on it when one exists.
 #
-# Profiles live at deployments/profiles/<env-stem>-profile.env where
-# <env-stem> is the env example basename minus "-rank.env.example".
+# Profiles live at deployments/profiles/<stem>-profile.env where <stem> is
+# the env example basename minus "_rank.env.example".
 
 set -euo pipefail
 
@@ -181,10 +185,20 @@ ITEMS=("${models[@]}")
 pick_from_list "Which model directory?" "${ITEMS[@]}"
 model=${ITEMS[pick - 1]}
 model_dir=$deployments_root/$model
-env_examples=("$model_dir"/*_rank-env.example)
-pair-serves=("$model_dir"/*_pair-serve.sh)
+shopt -s nullglob
+env_examples=("$model_dir"/*_rank.env.example)
+pair_serves=("$model_dir"/*_pair-serve.sh)
+# Off-convention example names (e.g. *_rank-env.example): name the fix
+# instead of reporting "none found".
+misnamed=("$model_dir"/*rank*env*.example)
 shopt -u nullglob
-(( ${#env_examples[@]} > 0 )) || die "no *-rank.env.example in $model_dir"
+if (( ${#env_examples[@]} == 0 )); then
+  if (( ${#misnamed[@]} > 0 )); then
+    m=${misnamed[0]##*/}
+    die "found $m but the convention is <stem>_rank.env.example -- rename it: mv '$model_dir/$m' '$model_dir/${m%%_rank*}_rank.env.example'"
+  fi
+  die "no *_rank.env.example in $model_dir"
+fi
 if (( ${#env_examples[@]} == 1 )); then
   env_example=${env_examples[0]}
 else
@@ -193,15 +207,18 @@ else
   env_example=${env_examples[pick - 1]}
 fi
 stem=${env_example##*/}
-stem=${stem%-rank.env.example}
+stem=${stem%_rank.env.example}
 
-pair-serve=
-if (( ${#pair-serves[@]} == 1 )); then
-  pair-serve=${pair-serves[0]}
-elif (( ${#pair-serves[@]} > 1 )); then
-  ITEMS=("${pair-serves[@]#$model_dir/}")
+# Prefer the launcher whose stem matches the env example's.
+pair_serve=
+if [[ -f $model_dir/${stem}_pair-serve.sh ]]; then
+  pair_serve=$model_dir/${stem}_pair-serve.sh
+elif (( ${#pair_serves[@]} == 1 )); then
+  pair_serve=${pair_serves[0]}
+elif (( ${#pair_serves[@]} > 1 )); then
+  ITEMS=("${pair_serves[@]#$model_dir/}")
   pick_from_list "Which pair serve (for the post-write check)?" "${ITEMS[@]}"
-  pair-serve=${pair-serves[pick - 1]}
+  pair_serve=${pair_serves[pick - 1]}
 else
   printf 'env-create: warning: no *_pair-serve.sh in %s — skipping post-check\n' "$model_dir" >&2
 fi
@@ -418,17 +435,17 @@ mv "$tmp" "$target"
 printf 'wrote: %s\n' "$target"
 
 # --- 8. post-check -----------------------------------------------------------
-if [[ -n $pair-serve ]]; then
-  printf 'checking: %s --check %s\n' "${pair-serve##*/}" "${target##*/}"
-  if ! bash "$pair-serve" --check "$target"; then
+if [[ -n $pair_serve ]]; then
+  printf 'checking: %s --check %s\n' "${pair_serve##*/}" "${target##*/}"
+  if ! bash "$pair_serve" --check "$target"; then
     printf 'env-create: --check failed for %s\n' "$target" >&2
     exit 1
   fi
   if [[ $rank == 1 ]]; then
-    printf 'next (start rank 1 first): ./%s --run %s\n' "${pair-serve##*/}" "${target##*/}"
-    printf 'then on rank 0:            ./%s --run rank-0.env\n' "${pair-serve##*/}"
+    printf 'next (start rank 1 first): ./%s --run %s\n' "${pair_serve##*/}" "${target##*/}"
+    printf 'then on rank 0:            ./%s --run rank-0.env\n' "${pair_serve##*/}"
   else
-    printf 'next (after rank 1):       ./%s --run %s\n' "${pair-serve##*/}" "${target##*/}"
+    printf 'next (after rank 1):       ./%s --run %s\n' "${pair_serve##*/}" "${target##*/}"
   fi
 else
   exit 0
