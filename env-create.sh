@@ -181,8 +181,8 @@ ITEMS=("${models[@]}")
 pick_from_list "Which model directory?" "${ITEMS[@]}"
 model=${ITEMS[pick - 1]}
 model_dir=$deployments_root/$model
-env_examples=("$model_dir"/*_rank.env.example)
-pair_serves=("$model_dir"/*_pair_serve.sh)
+env_examples=("$model_dir"/*_rank-env.example)
+pair-serves=("$model_dir"/*_pair-serve.sh)
 shopt -u nullglob
 (( ${#env_examples[@]} > 0 )) || die "no *-rank.env.example in $model_dir"
 if (( ${#env_examples[@]} == 1 )); then
@@ -195,15 +195,15 @@ fi
 stem=${env_example##*/}
 stem=${stem%-rank.env.example}
 
-pair_serve=
-if (( ${#pair_serves[@]} == 1 )); then
-  pair_serve=${pair_serves[0]}
-elif (( ${#pair_serves[@]} > 1 )); then
-  ITEMS=("${pair_serves[@]#$model_dir/}")
+pair-serve=
+if (( ${#pair-serves[@]} == 1 )); then
+  pair-serve=${pair-serves[0]}
+elif (( ${#pair-serves[@]} > 1 )); then
+  ITEMS=("${pair-serves[@]#$model_dir/}")
   pick_from_list "Which pair serve (for the post-write check)?" "${ITEMS[@]}"
-  pair_serve=${pair_serves[pick - 1]}
+  pair-serve=${pair-serves[pick - 1]}
 else
-  printf 'env-create: warning: no *_pair_serve.sh in %s — skipping post-check\n' "$model_dir" >&2
+  printf 'env-create: warning: no *_pair-serve.sh in %s — skipping post-check\n' "$model_dir" >&2
 fi
 
 # --- 3. backup prompt --------------------------------------------------------
@@ -418,17 +418,17 @@ mv "$tmp" "$target"
 printf 'wrote: %s\n' "$target"
 
 # --- 8. post-check -----------------------------------------------------------
-if [[ -n $pair_serve ]]; then
-  printf 'checking: %s --check %s\n' "${pair_serve##*/}" "${target##*/}"
-  if ! bash "$pair_serve" --check "$target"; then
+if [[ -n $pair-serve ]]; then
+  printf 'checking: %s --check %s\n' "${pair-serve##*/}" "${target##*/}"
+  if ! bash "$pair-serve" --check "$target"; then
     printf 'env-create: --check failed for %s\n' "$target" >&2
     exit 1
   fi
   if [[ $rank == 1 ]]; then
-    printf 'next (start rank 1 first): ./%s --run %s\n' "${pair_serve##*/}" "${target##*/}"
-    printf 'then on rank 0:            ./%s --run rank-0.env\n' "${pair_serve##*/}"
+    printf 'next (start rank 1 first): ./%s --run %s\n' "${pair-serve##*/}" "${target##*/}"
+    printf 'then on rank 0:            ./%s --run rank-0.env\n' "${pair-serve##*/}"
   else
-    printf 'next (after rank 1):       ./%s --run %s\n' "${pair_serve##*/}" "${target##*/}"
+    printf 'next (after rank 1):       ./%s --run %s\n' "${pair-serve##*/}" "${target##*/}"
   fi
 else
   exit 0
