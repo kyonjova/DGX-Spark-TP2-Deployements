@@ -1,0 +1,16 @@
+# Dockerfile.io-uring -- the kk-beta-cu132 serving image plus liburing, for
+# the b12x loader's O_DIRECT io_uring bounce reader (MiMo-V2.6-Flash-RL and
+# any other LOAD_FORMAT=b12x model). Same pattern as vllm
+# docker/Dockerfile.spark-io-uring (liburing-dev + pkg-config).
+#
+#   docker build -f Dockerfile.io-uring \
+#     -t local/vllm:karmic-kraken-beta-cu132-io-uring .
+#   docker save local/vllm:karmic-kraken-beta-cu132-io-uring | ssh <node2> docker load
+ARG BASE_IMAGE=local/vllm:karmic-kraken-beta-cu132
+FROM ${BASE_IMAGE}
+SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends liburing-dev pkg-config \
+ && rm -rf /var/lib/apt/lists/* \
+ && pkg-config --exists liburing \
+ && echo "liburing $(pkg-config --modversion liburing)"

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# mimo-v2.6-flash-rl_pair_serve.sh
+# mimo-v2.6-flash-rl_pair-serve.sh
 #
 # Validate or start one rank of a two-node DGX Spark pair (TP=2 over the
 # direct ConnectX-7 RoCE link) serving XiaomiMiMo/MiMo-V2.6-Flash-RL under
-# vLLM (karmic-kraken @ 57fdda71 + b12x @ 8a99d639 -- the kk-beta-cu132
+# vLLM (karmic-kraken @ e77be225 + b12x @ 8a99d639 -- the kk-beta-cu132
 # profile). Model: MiMoV2ForCausalLM -- 48 layers, hidden 4096, head_dim 192
 # full attention alternating with SWA layers (hybrid_layer_pattern), MXFP4
 # routed experts + block-FP8 projections, image/video encoders, audio via the
@@ -28,15 +28,15 @@
 # target.
 #
 # Usage:
-#     ./mimo-v2.6-flash-rl_pair_serve.sh --check   rank-0.env
-#     ./mimo-v2.6-flash-rl_pair_serve.sh --run     rank-0.env
-#     ./mimo-v2.6-flash-rl_pair_serve.sh --restart rank-0.env
-#     ./mimo-v2.6-flash-rl_pair_serve.sh --down    rank-0.env
-#     ./mimo-v2.6-flash-rl_pair_serve.sh --logs    rank-0.env
-#     ./mimo-v2.6-flash-rl_pair_serve.sh --verify  rank-0.env
-#     ./mimo-v2.6-flash-rl_pair_serve.sh --status  rank-0.env
-#     ./mimo-v2.6-flash-rl_pair_serve.sh --clear   rank-0.env
-#     ./mimo-v2.6-flash-rl_pair_serve.sh --fresh   rank-0.env
+#     ./mimo-v2.6-flash-rl_pair-serve.sh --check   rank-0.env
+#     ./mimo-v2.6-flash-rl_pair-serve.sh --run     rank-0.env
+#     ./mimo-v2.6-flash-rl_pair-serve.sh --restart rank-0.env
+#     ./mimo-v2.6-flash-rl_pair-serve.sh --down    rank-0.env
+#     ./mimo-v2.6-flash-rl_pair-serve.sh --logs    rank-0.env
+#     ./mimo-v2.6-flash-rl_pair-serve.sh --verify  rank-0.env
+#     ./mimo-v2.6-flash-rl_pair-serve.sh --status  rank-0.env
+#     ./mimo-v2.6-flash-rl_pair-serve.sh --clear   rank-0.env
+#     ./mimo-v2.6-flash-rl_pair-serve.sh --fresh   rank-0.env
 #
 # Anything after ENV_FILE is appended verbatim to the vllm serve argv.
 #
@@ -44,9 +44,12 @@
 
 set -euo pipefail
 
+# Directory of this script: relative SECCOMP_PROFILE paths resolve here.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
 usage() {
   cat >&2 <<'EOF'
-usage: mimo-v2.6-flash-rl_pair_serve.sh [MODE] ENV_FILE [extra vllm args...]
+usage: mimo-v2.6-flash-rl_pair-serve.sh [MODE] ENV_FILE [extra vllm args...]
 
   --check     validate the env file and print the launch command (default)
   --run       validate, then start the container detached
@@ -144,7 +147,7 @@ fi
 # on 2026-09-11). Refuse an empty value for any key the launcher does not
 # consume. Models extend the allow-list via MODEL_EMPTY_OK_KEYS
 # (space-separated).
-LAUNCHER_EMPTY_OK_KEYS="API_KEY NUM_SPECULATIVE_TOKENS KV_CACHE_MEMORY_BYTES CONTAINER_MEMORY_GB CONTAINER_NAME_SUFFIX PREFILL_SCHEDULE_INTERVAL FAIRNESS_ENGINE PREFILL_COMPUTE_SHARE PREFILL_COMPUTE_HALF_LIFE MAX_PARALLEL_PREFILLS SECCOMP_PROFILE VLLM_KV_CACHE_LAYOUT CUSTOM_OPS ASYNC_SCHEDULING PREFIX_RETENTION_INTERVAL COMPILATION_LEVEL SAMPLING_TEMPERATURE SAMPLING_TOP_P SAMPLING_TOP_K SAMPLING_MIN_P SAMPLING_REPETITION_PENALTY MM_PROCESSOR_CACHE_GB MM_ENCODER_TP_MODE CHAT_TEMPLATE_HOST_PATH TORCH_PROFILE_HOST_DIR VLLM_PLUGINS"
+LAUNCHER_EMPTY_OK_KEYS="API_KEY NUM_SPECULATIVE_TOKENS KV_CACHE_MEMORY_BYTES CONTAINER_MEMORY_GB CONTAINER_NAME_SUFFIX PREFILL_SCHEDULE_INTERVAL FAIRNESS_ENGINE PREFILL_COMPUTE_SHARE PREFILL_COMPUTE_HALF_LIFE MAX_PARALLEL_PREFILLS SECCOMP_PROFILE CUSTOM_OPS ASYNC_SCHEDULING PREFIX_RETENTION_INTERVAL COMPILATION_LEVEL SAMPLING_TEMPERATURE SAMPLING_TOP_P SAMPLING_TOP_K SAMPLING_MIN_P SAMPLING_REPETITION_PENALTY MM_PROCESSOR_CACHE_GB MM_ENCODER_TP_MODE CHAT_TEMPLATE_HOST_PATH TORCH_PROFILE_HOST_DIR VLLM_PLUGINS"
 MODEL_EMPTY_OK_KEYS="B12X_AUTOTUNE"
 empty_bad=""
 for k in $(grep -Eo '^[[:space:]]*[A-Z][A-Z0-9_]*=[[:space:]]*$' "$env_file" | tr -d ' ='); do
@@ -334,7 +337,7 @@ require_unit_fraction() {
 : "${GPU_MEMORY_UTILIZATION:=0.90}"   # pair default; GB10 cu132 ceiling ~0.913; catalog's 0.98 is the RTX TP4 value
 : "${KV_CACHE_MEMORY_BYTES:=}"         # empty = let vLLM profile and choose (MiMo pool math never measured anywhere)
 : "${KV_CACHE_DTYPE:=bfloat16}"        # catalog-qualified for MiMo's 192-dim attention; fp8 UNVERIFIED on this model (A/B later)
-: "${QUANTIZATION:=modelopt_mixed}"    # `auto` omits the flag (checkpoint self-describes)
+: "${QUANTIZATION:=auto}"              # auto = omit the flag. The checkpoint is quant_method fp8 (store_dtype mxfp4), NOT ModelOpt: modelopt_mixed fails vLLM's quant-method check. KK serve-mimo26-flash.sh passes no --quantization
 : "${PREFILL_SCHEDULE_INTERVAL:=}"     # empty = engine default; the GLM pair's 8 is an unmeasured import here
 : "${COMPILATION_LEVEL:=}"             # empty = no -O flag; 0-3 passes -O<N> (torch.compile level) -- A/B only
 : "${GENERATION_CONFIG:=vllm}"         # catalog: vllm (MiMo's generation_config is not authoritative); override-generation-config carries 1.0/0.95 (Luke's launcher)
@@ -364,6 +367,7 @@ require_unit_fraction() {
 : "${INSTANTTENSOR_IO_DEPTH:=3}"
 : "${INSTANTTENSOR_CONCURRENCY:=1}"
 : "${INSTANTTENSOR_CHUNK_SIZE:=8388608}"
+: "${INSTANTTENSOR_COPY:=auto}"
 : "${API_KEY:=}"                       # empty = open port; set to require Authorization: Bearer <key> on rank 0
 : "${ENABLE_FLASHINFER_AUTOTUNE:=0}"   # catalog kernels.flashinfer_autotune false; B12X owns attention/MoE/linear
 : "${MOE_BACKEND:=b12x}"               # catalog contract: b12x | humming | auto
@@ -398,14 +402,18 @@ case "$SPECULATOR" in
   *) die "SPECULATOR must be none or mtp: $SPECULATOR (dflash is deferred -- pro-lineage, needs a draft snapshot)" ;;
 esac
 
-require_positive_integer PREFILL_SCHEDULE_INTERVAL
+[ -z "$PREFILL_SCHEDULE_INTERVAL" ] || require_positive_integer PREFILL_SCHEDULE_INTERVAL
 case "$COMPILATION_LEVEL" in ""|0|1|2|3) : ;; *) die "COMPILATION_LEVEL must be empty or 0-3: $COMPILATION_LEVEL" ;; esac
 case "$GENERATION_CONFIG" in auto|vllm) : ;; *) die "GENERATION_CONFIG must be auto or vllm: $GENERATION_CONFIG" ;; esac
 [ -z "$FAIRNESS_ENGINE" ] || die "FAIRNESS_ENGINE=$FAIRNESS_ENGINE: --fairness-engine no longer exists on karmic-kraken; remove it and set PREFILL_COMPUTE_SHARE alone (with PREFILL_SCHEDULE_INTERVAL=1)"
+seccomp_opt=""
 case "$SECCOMP_PROFILE" in
-  ""|unconfined) : ;;
-  /*) [ -f "$SECCOMP_PROFILE" ] || die "SECCOMP_PROFILE does not exist: $SECCOMP_PROFILE" ;;
-  *) [ -f "$SCRIPT_DIR/$SECCOMP_PROFILE" ] || [ -f "$SECCOMP_PROFILE" ] || die "SECCOMP_PROFILE does not exist: $SECCOMP_PROFILE" ;;
+  "") : ;;
+  unconfined) seccomp_opt=unconfined ;;
+  /*) [ -f "$SECCOMP_PROFILE" ] || die "SECCOMP_PROFILE does not exist: $SECCOMP_PROFILE"; seccomp_opt=$SECCOMP_PROFILE ;;
+  *) if [ -f "$SCRIPT_DIR/$SECCOMP_PROFILE" ]; then seccomp_opt=$SCRIPT_DIR/$SECCOMP_PROFILE
+     elif [ -f "$SECCOMP_PROFILE" ]; then seccomp_opt=$(cd "$(dirname "$SECCOMP_PROFILE")" && pwd)/$(basename "$SECCOMP_PROFILE")
+     else die "SECCOMP_PROFILE does not exist: $SECCOMP_PROFILE (looked in $SCRIPT_DIR and the current directory)"; fi ;;
 esac
 case "$MAX_PARALLEL_PREFILLS" in ""|auto) : ;; *) require_positive_integer MAX_PARALLEL_PREFILLS ;; esac
 case "$LOAD_FORMAT" in
@@ -428,7 +436,7 @@ if [ -n "$PREFILL_COMPUTE_SHARE" ]; then
   [ "$PREFILL_COMPUTE_SHARE" = auto ] \
     || awk -v v="$PREFILL_COMPUTE_SHARE" 'BEGIN{ exit !(v+0 > 0 && v+0 < 1 && v ~ /^[0-9]*\.?[0-9]+$/) }' \
     || die "PREFILL_COMPUTE_SHARE must be auto or a fraction in (0,1): $PREFILL_COMPUTE_SHARE"
-  [ "$PREFILL_SCHEDULE_INTERVAL" = 1 ] \
+  [ -z "$PREFILL_SCHEDULE_INTERVAL" ] || [ "$PREFILL_SCHEDULE_INTERVAL" = 1 ] \
     || die "PREFILL_COMPUTE_SHARE=$PREFILL_COMPUTE_SHARE requires PREFILL_SCHEDULE_INTERVAL=1 (the engine rejects share + interval > 1; the published GLM profile runs 0.4 / 1)"
   if [ -n "$PREFILL_COMPUTE_HALF_LIFE" ]; then
     [ "$PREFILL_COMPUTE_SHARE" = auto ] || die "PREFILL_COMPUTE_HALF_LIFE is only valid with PREFILL_COMPUTE_SHARE=auto"
@@ -566,7 +574,7 @@ case "$CUDAGRAPH_MODE" in
   *) die "CUDAGRAPH_MODE must be FULL, FULL_AND_PIECEWISE, PIECEWISE, or NONE: $CUDAGRAPH_MODE" ;;
 esac
 case "$VLLM_KV_CACHE_LAYOUT" in
-  ""|BLHNC|LBHNC|HNC|NHC|LNC|CNL) : ;;
+  ""|LBNHC|LBHNC|LHBNC|NHD|HND|BLHNC|BLNHC|BHLNC) : ;;
   *) die "VLLM_KV_CACHE_LAYOUT must be empty or a layout name (BLHNC for the mixed-page DFlash A/B): $VLLM_KV_CACHE_LAYOUT" ;;
 esac
 
@@ -789,10 +797,15 @@ if [ "$LOAD_FORMAT" = b12x ] \
    && command -v "$CONTAINER_RUNTIME" >/dev/null 2>&1 \
    && "$CONTAINER_RUNTIME" image inspect "$SERVING_IMAGE" >/dev/null 2>&1; then
   seccomp_args=()
-  if [ -n "$SECCOMP_PROFILE" ]; then
-    _sp="$SECCOMP_PROFILE"; case "$_sp" in /*) ;; *) _sp="$SCRIPT_DIR/$_sp" ;; esac
-    seccomp_args=(--security-opt "seccomp=$_sp")
-  fi
+  [ -z "$seccomp_opt" ] || seccomp_args=(--security-opt "seccomp=$seccomp_opt")
+  # The loader's Spark read path (read_mode auto -> "bounce" on unified
+  # memory) is compiled at first use against liburing; b12x's native build
+  # treats liburing as optional and, without it, bounce_create() fails with
+  # "io_uring bounce support is unavailable: install liburing development
+  # headers and pkg-config". The stock cu132 image has pkg-config but NOT
+  # liburing-dev -- check it here instead of 90 s into the load.
+  "$CONTAINER_RUNTIME" run --rm --entrypoint sh "$SERVING_IMAGE" -c 'pkg-config --exists liburing' >/dev/null 2>&1 \
+    || die "LOAD_FORMAT=b12x: $SERVING_IMAGE has no liburing development files, so the b12x loader's io_uring bounce reader cannot build (\"io_uring bounce support is unavailable\"). Build the derived image (Dockerfile.io-uring next to this launcher, apt liburing-dev) and point SERVING_IMAGE at it on BOTH nodes" 
   probe_out="$("$CONTAINER_RUNTIME" run --rm "${seccomp_args[@]}" \
     --entrypoint /opt/venv/bin/python "$SERVING_IMAGE" -c '
 import ctypes, errno
@@ -802,7 +815,7 @@ err = ctypes.get_errno()
 raise SystemExit("BLOCKED" if err == errno.EPERM else "OK")
 ' 2>&1 || true)"
   case "$probe_out" in
-    *BLOCKED*) die "io_uring is BLOCKED inside the container (seccomp) -- the b12x loader reads weights through an io_uring ring, so every weight read would fail with EPERM. Set SECCOMP_PROFILE=seccomp-io-uring.json (shipped next to this script) or upgrade the container runtime" ;;
+    *BLOCKED*) die "io_uring is BLOCKED inside the container (EPERM) -- the b12x loader reads weights through an io_uring ring. Either the container seccomp blocks it (set SECCOMP_PROFILE=seccomp-io-uring.json, shipped next to this script; Docker >= 25's default profile drops io_uring) or the HOST disables it: check 'sysctl kernel.io_uring_disabled' (must be 0; 1 still refuses a container without CAP_SYS_ADMIN)" ;;
   esac
 fi
 
@@ -824,7 +837,8 @@ if [ "$LOAD_FORMAT" = instanttensor ]; then
     -e INSTANTTENSOR_CHUNK_SIZE="$INSTANTTENSOR_CHUNK_SIZE"
   )
 fi
-extra_args=(--prefill-schedule-interval "$PREFILL_SCHEDULE_INTERVAL")
+extra_args=()
+[ -z "$PREFILL_SCHEDULE_INTERVAL" ] || extra_args+=(--prefill-schedule-interval "$PREFILL_SCHEDULE_INTERVAL")
 case "$INSTANTTENSOR_COPY" in
   auto) : ;;
   0|1) warn "INSTANTTENSOR_COPY=$INSTANTTENSOR_COPY passes instanttensor_copy to the loader; vllm pins >= 6575b5ac (2026-09-05) removed that option (launchers moved to --load-format fastsafetensors)" ;;&
@@ -840,7 +854,6 @@ if [ "$ASYNC_SCHEDULING" = 1 ]; then extra_args+=(--async-scheduling); fi
 [ -z "$MM_ENCODER_TP_MODE" ] || extra_args+=(--mm-encoder-tp-mode "$MM_ENCODER_TP_MODE")
 # generation-config: default vllm is emitted literally in the command;
 # only emit here when set to something else.
-[ "$GENERATION_CONFIG" = "vllm" ] || [ "$GENERATION_CONFIG" = auto ] || extra_args+=(--generation-config "$GENERATION_CONFIG")
 chat_template_container_path=/models/chat_template.jinja
 [ -z "$CHAT_TEMPLATE_HOST_PATH" ] || extra_args+=(--chat-template "$chat_template_container_path")
 
@@ -907,7 +920,15 @@ fi
 
 # Catalog compilation contract for MiMo: custom_ops none (GLM/Qwen force
 # ["all"]; MiMo's qualified config does not).
-compilation_config=$(printf '{"cudagraph_mode":"%s","custom_ops":["%s"]}' "$CUDAGRAPH_MODE" "${CUSTOM_OPS:-none}")
+# KK's serve-mimo26-flash.sh passes NO compilation config: custom_ops keeps
+# the engine default. Forcing ["none"] would turn off vLLM's custom CUDA ops
+# (rms_norm etc. fall back to native torch) on a CUDA-graph-only run, so it
+# is emitted only when CUSTOM_OPS is set explicitly.
+if [ -n "${CUSTOM_OPS:-}" ]; then
+  compilation_config=$(printf '{"cudagraph_mode":"%s","custom_ops":["%s"]}' "$CUDAGRAPH_MODE" "$CUSTOM_OPS")
+else
+  compilation_config=$(printf '{"cudagraph_mode":"%s"}' "$CUDAGRAPH_MODE")
+fi
 
 case "$CONTAINER_RUNTIME" in
   podman) gpu_args=(--device nvidia.com/gpu=all --security-opt label=disable) ;;
@@ -937,7 +958,7 @@ command=(
   --ulimit memlock=-1:-1
   ${CONTAINER_MEMORY_GB:+--memory ${CONTAINER_MEMORY_GB}g --memory-swap $((${CONTAINER_MEMORY_GB:-0}+4))g}
   --device /dev/infiniband
-  ${SECCOMP_PROFILE:+--security-opt seccomp="$([ "${SECCOMP_PROFILE:0:1}" = / ] && echo "$SECCOMP_PROFILE" || echo "$SCRIPT_DIR/$SECCOMP_PROFILE")"}
+  ${seccomp_opt:+--security-opt "seccomp=$seccomp_opt"}
   "${mount_args[@]}"
   --env-file "$env_file"
   # The image bakes VLLM_PCIE_ALLREDUCE_BACKEND=cpp (the pre-rename value).
@@ -990,8 +1011,8 @@ command=(
   --reasoning-parser mimo
   --tool-call-parser mimo
   --enable-auto-tool-choice
-  --generation-config vllm
-  ${sampling_override_args[@]}
+  --generation-config "$GENERATION_CONFIG"
+  "${sampling_override_args[@]}"
   "${speculative_args[@]}"
   --served-model-name "$SERVED_MODEL_NAME"
 
@@ -1034,7 +1055,7 @@ printf '  SPECULATOR:              %s (%s draft tokens)\n' \
 if [ -n "$PREFILL_COMPUTE_SHARE" ]; then
   printf '  PREFILL:                 compute share %s, interval %s%s\n' "$PREFILL_COMPUTE_SHARE" "$PREFILL_SCHEDULE_INTERVAL" "${MAX_PARALLEL_PREFILLS:+, max parallel $MAX_PARALLEL_PREFILLS}"
 else
-  printf '  PREFILL:                 schedule interval %s%s\n' "$PREFILL_SCHEDULE_INTERVAL" "${MAX_PARALLEL_PREFILLS:+, max parallel $MAX_PARALLEL_PREFILLS}"
+  printf '  PREFILL:                 schedule interval %s%s\n' "${PREFILL_SCHEDULE_INTERVAL:-engine default}" "${MAX_PARALLEL_PREFILLS:+, max parallel $MAX_PARALLEL_PREFILLS}"
 fi
 printf '  KV_CACHE_MEMORY_BYTES:   %s (%s)\n' \
   "${KV_CACHE_MEMORY_BYTES:-profiled at $GPU_MEMORY_UTILIZATION}" "$KV_CACHE_DTYPE"
