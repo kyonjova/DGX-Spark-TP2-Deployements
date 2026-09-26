@@ -196,8 +196,9 @@ adaptive_speculative_fields() {
 # humming): '{"method":"mtp","num_speculative_tokens":3,"moe_backend":"b12x"}'.
 model_speculative_config() {
   case "$SPECULATOR" in
-    mtp) printf '{"method":"mtp","num_speculative_tokens":%s,"moe_backend":"%s","attention_backend":"%s"%s}' \
-           "$NUM_SPECULATIVE_TOKENS" "${MTP_MOE_BACKEND:-b12x}" "${MTP_ATTENTION_BACKEND:-B12X}" \
+    mtp) printf '{"method":"mtp","num_speculative_tokens":%s,"draft_sample_method":"%s","rejection_sample_method":"%s","moe_backend":"%s","attention_backend":"%s"%s}' \
+           "$NUM_SPECULATIVE_TOKENS" "$DRAFT_SAMPLE_METHOD" "$REJECTION_SAMPLE_METHOD" \
+           "${MTP_MOE_BACKEND:-b12x}" "${MTP_ATTENTION_BACKEND:-B12X}" \
            "$(adaptive_speculative_fields)" ;;
     *) die "model_speculative_config: no JSON defined for SPECULATOR=$SPECULATOR" ;;
   esac
@@ -235,6 +236,8 @@ model_chat_template_kwargs() {
 
 # hook: extra lines for the --check summary (printf, 2-space indent, 25-col key).
 model_summary() {
+  printf '  HC projections:          %s\n' \
+    "$(case "$VLLM_QWEN3_8_FLASH_NEXT_HC_TP" in 0) echo 'replicated (HC_TP=0)' ;; 1) echo 'TP-sharded (HC_TP=1)' ;; *) echo 'engine default (TP-sharded when hc_lowrank divides by TP)' ;; esac)"
   printf '  PLE offload:             %s\n' \
     "$([ "$VLLM_PLE_CPU_OFFLOAD" = 1 ] && echo 'host RAM (qualified)' || echo 'device-resident (NOT qualified)')"
 }
@@ -528,7 +531,19 @@ model_defaults   # hook: model fallbacks
 : "${ADAPTIVE_SPECULATIVE_TOKENS_WINDOW:=32}" # verification steps per depth adjustment
 : "${SERVING_IMAGE:=local/vllm:karmic-kraken-beta-cu132}"  # default: the kk-beta-cu132 build; override with a tag/digest present on BOTH nodes
 : "${MEM_PREFLIGHT:=die}"                    # die | warn | off -- host free-memory gate below
-: "${FABRIC_PROFILE:=single}"                # single | dual -- see the fabric checks below
+: "${FABRIC_PROFILE:=single}"                # single | dualpath | dual -- see the fabric checks below
+: "${B12X_ROCE_HCA:=}"                       # empty = RoCEnante follows NCCL_IB_HCA (b12x discover_hcas, at most two)
+# Speculative sampling (KK SpeculativeConfig). probabilistic = drafts sampled
+# from the draft distribution and the full ratio test; greedy = engine default.
+: "${DRAFT_SAMPLE_METHOD:=probabilistic}"
+: "${REJECTION_SAMPLE_METHOD:=standard}"      # standard | block | synthetic
+# Explicit CUDA-graph capture sizes. auto = 1, 2 and every multiple of
+# (NUM_SPECULATIVE_TOKENS + 1) up to MAX_CUDAGRAPH_CAPTURE_SIZE; a list =
+# emitted verbatim; empty = the engine's default grid.
+: "${CUDAGRAPH_CAPTURE_SIZES=auto}"   # "=" not ":=": an empty line in the env file means engine default
+# Hyper-connection projection sharding across TP (KK envs.py default 1).
+# Empty = leave the engine default.
+: "${VLLM_QWEN3_8_FLASH_NEXT_HC_TP:=}"
 # Scheduler/loader/profiling knobs. All default to "omit the flag" so the
 # template runs on an image that has never heard of them; an unknown CLI flag
 # is an argparse error at exec, unlike an unknown env var which only warns.
@@ -649,7 +664,15 @@ if [ "$ADAPTIVE_SPECULATIVE_TOKENS" = 1 ]; then
     || die "ADAPTIVE_SPECULATIVE_TOKENS_INITIAL must not exceed NUM_SPECULATIVE_TOKENS"
 fi
 case "$MEM_PREFLIGHT" in die|warn|off) : ;; *) die "MEM_PREFLIGHT must be die, warn, or off: $MEM_PREFLIGHT" ;; esac
-case "$FABRIC_PROFILE" in single|dual) : ;; *) die "FABRIC_PROFILE must be single or dual: $FABRIC_PROFILE" ;; esac
+case "$FABRIC_PROFILE" in single|dualpath|dual) : ;; *) die "FABRIC_PROFILE must be single, dualpath, or dual: $FABRIC_PROFILE" ;; esac
+case "$DRAFT_SAMPLE_METHOD" in greedy|probabilistic) : ;; *) die "DRAFT_SAMPLE_METHOD must be greedy or probabilistic: $DRAFT_SAMPLE_METHOD" ;; esac
+case "$REJECTION_SAMPLE_METHOD" in standard|block|synthetic) : ;; *) die "REJECTION_SAMPLE_METHOD must be standard, block, or synthetic: $REJECTION_SAMPLE_METHOD" ;; esac
+[ -z "$VLLM_QWEN3_8_FLASH_NEXT_HC_TP" ] || require_bool VLLM_QWEN3_8_FLASH_NEXT_HC_TP
+# envs.py parses it with int(): an empty line in the env file reaches the
+# container via --env-file as "" and kills every worker at import. Delete the
+# line (engine default) or give it 0/1.
+! grep -Eq '^VLLM_QWEN3_8_FLASH_NEXT_HC_TP=[[:space:]]*$' "$env_file" \
+  || die "VLLM_QWEN3_8_FLASH_NEXT_HC_TP is present but empty in $env_file: the engine int()-parses it and crashes; set 0 or 1, or delete the line"
 case "$GENERATION_CONFIG" in auto|vllm) : ;; *) die "GENERATION_CONFIG must be auto or vllm: $GENERATION_CONFIG" ;; esac
 case "$FUSE_ACT_QUANT" in ""|0|1) : ;; *) die "FUSE_ACT_QUANT must be empty, 0, or 1: $FUSE_ACT_QUANT" ;; esac
 case "$COMPILATION_LEVEL" in ""|0|1|2|3) : ;; *) die "COMPILATION_LEVEL must be empty or 0-3: $COMPILATION_LEVEL" ;; esac
@@ -786,6 +809,52 @@ esac
 # capture size the largest batches fall out of cudagraph replay; above the
 # step budget vLLM cannot schedule a full step at all.
 decode_batch=$(( MAX_NUM_SEQS * (NUM_SPECULATIVE_TOKENS + 1) ))
+
+# CUDA-graph capture sizes. A speculative decode step is C x (depth+1) rows
+# and replays the smallest captured size >= that, so a grid with a gap pads
+# every step: KK's default for MTP3 / 16 seqs is 1,2,4,8,16,...,64 in steps of
+# 8 plus 4 x {1,2,4,8,16}, so C3/C5/C7... pad by one request (C3: 12 -> 16
+# rows, +33% work). auto captures every multiple of (depth+1) -- Dooner's TP2
+# list [1,2,4,8,12,...,64]. vLLM refuses a list whose maximum differs from
+# --max-cudagraph-capture-size, so the list always ends at that value.
+capture_sizes_json=""
+case "$CUDAGRAPH_CAPTURE_SIZES" in
+  "") ;;
+  auto)
+    # Without a speculator every row count is a valid step; the engine's
+    # default grid is the right answer there, not 1..MAX.
+    if [ "$SPECULATOR" = none ] || [ "$NUM_SPECULATIVE_TOKENS" = 0 ]; then
+      CUDAGRAPH_CAPTURE_SIZES=""
+    else
+    capture_step=$(( NUM_SPECULATIVE_TOKENS + 1 ))
+    capture_list="1"
+    [ "$MAX_CUDAGRAPH_CAPTURE_SIZE" -lt 2 ] || capture_list="$capture_list,2"
+    capture_size=$capture_step
+    while [ "$capture_size" -le "$MAX_CUDAGRAPH_CAPTURE_SIZE" ]; do
+      [ "$capture_size" -le 2 ] || capture_list="$capture_list,$capture_size"
+      capture_size=$(( capture_size + capture_step ))
+    done
+    case ",$capture_list," in
+      *",$MAX_CUDAGRAPH_CAPTURE_SIZE,"*) ;;
+      *) capture_list="$capture_list,$MAX_CUDAGRAPH_CAPTURE_SIZE" ;;
+    esac
+    CUDAGRAPH_CAPTURE_SIZES=$capture_list
+    fi
+    ;;
+  *)
+    printf '%s' "$CUDAGRAPH_CAPTURE_SIZES" | grep -Eq '^[1-9][0-9]*(,[1-9][0-9]*)*$' \
+      || die "CUDAGRAPH_CAPTURE_SIZES must be auto, empty, or ascending comma-separated positive integers (no spaces): $CUDAGRAPH_CAPTURE_SIZES"
+    capture_prev=0
+    IFS=, read -r -a capture_items <<< "$CUDAGRAPH_CAPTURE_SIZES"
+    for capture_size in "${capture_items[@]}"; do
+      [ "$capture_size" -gt "$capture_prev" ] || die "CUDAGRAPH_CAPTURE_SIZES must be strictly ascending: $CUDAGRAPH_CAPTURE_SIZES"
+      capture_prev=$capture_size
+    done
+    [ "$capture_prev" = "$MAX_CUDAGRAPH_CAPTURE_SIZE" ] \
+      || die "CUDAGRAPH_CAPTURE_SIZES must end at MAX_CUDAGRAPH_CAPTURE_SIZE ($MAX_CUDAGRAPH_CAPTURE_SIZE); vLLM rejects inconsistent values: $CUDAGRAPH_CAPTURE_SIZES"
+    ;;
+esac
+[ -z "$CUDAGRAPH_CAPTURE_SIZES" ] || capture_sizes_json=",\"cudagraph_capture_sizes\":[$CUDAGRAPH_CAPTURE_SIZES]"
 if [ "$decode_batch" -gt "$MAX_CUDAGRAPH_CAPTURE_SIZE" ]; then
   warn "a full decode step is $decode_batch tokens (MAX_NUM_SEQS x (NUM_SPECULATIVE_TOKENS+1)) but MAX_CUDAGRAPH_CAPTURE_SIZE=$MAX_CUDAGRAPH_CAPTURE_SIZE; the largest batches fall out of cudagraph replay"
 fi
@@ -821,7 +890,22 @@ model_validate   # hook: model-specific keys and known-bad combinations
 #     links for roughly 2x cross-node bandwidth. Do not select this without
 #     the second cable physically present: NCCL will advertise a rail that
 #     cannot carry traffic and the pair hangs during the first allreduce.
-if [ "$FABRIC_PROFILE" = dual ]; then
+#   dualpath: ONE cable, both PCIe functions of that cage (the GB10 CX-7 is
+#     two Gen5 x4 functions -- rocep1s0f0 + roceP2p1s0f0 -- behind one port).
+#     Each function needs its own IPv4 in its own /24 so its RoCEv2 GID row is
+#     populated. MERGE_NICS=0 and SUBNET_AWARE_ROUTING=0: the published TP2
+#     profiles on this exact cabling (Dooner/SparkRing, el8) both run 0; el8
+#     measured 0 as required for separate QP setup. NCCL uses both devices
+#     and RoCEnante stripes each transfer across both HCAs.
+if [ "$FABRIC_PROFILE" = dualpath ]; then
+  [ "$NCCL_IB_MERGE_NICS" = 0 ] \
+    || warn "FABRIC_PROFILE=dualpath with NCCL_IB_MERGE_NICS=1: both published TP2 references run 0 on this cabling (el8: 0 required for separate QP setup); A/B only"
+  [ "$NCCL_IB_SUBNET_AWARE_ROUTING" = 0 ] \
+    || warn "FABRIC_PROFILE=dualpath with NCCL_IB_SUBNET_AWARE_ROUTING=1: only matters behind a switch; the references run 0"
+  pair_devices=$(printf '%s' "$NCCL_IB_HCA" | tr ',' '\n' | sed 's/^[=^]*//; s/:.*$//' | grep -c .)
+  [ "$pair_devices" = 2 ] \
+    || die "FABRIC_PROFILE=dualpath needs exactly the two PCIe functions of the cabled cage in NCCL_IB_HCA (e.g. rocep1s0f0,roceP2p1s0f0), got: $NCCL_IB_HCA"
+elif [ "$FABRIC_PROFILE" = dual ]; then
   [ "$NCCL_IB_MERGE_NICS" = 1 ] \
     || die "FABRIC_PROFILE=dual requires NCCL_IB_MERGE_NICS=1"
   [ "$NCCL_IB_SUBNET_AWARE_ROUTING" = 1 ] \
@@ -853,12 +937,43 @@ esac
   || die "rank-1 VLLM_HOST_IP must differ from MASTER_ADDR"
 
 case "$NCCL_IB_HCA" in
-  *,*) [ "$FABRIC_PROFILE" = dual ] \
-         || die "a single-rail pair names exactly one RoCE device; got $NCCL_IB_HCA (set FABRIC_PROFILE=dual only if both ports are cabled)" ;;
+  *,*) [ "$FABRIC_PROFILE" != single ] \
+         || die "a single-path pair names exactly one RoCE device; got $NCCL_IB_HCA (FABRIC_PROFILE=dualpath for both functions of one cable, dual only if both ports are cabled)" ;;
 esac
 case "$NCCL_IB_GID_INDEX" in
   ''|*[!0-9]*) die "NCCL_IB_GID_INDEX must be a decimal integer" ;;
 esac
+
+# Every RDMA device the pair will use must exist on THIS host and carry a
+# RoCEv2 IPv4 GID at NCCL_IB_GID_INDEX (b12x RoCEnante uses the same index).
+# A missing row is the classic silent hang: NCCL advertises the device and the
+# first collective never completes. Each rank checks its own host.
+fabric_devices=$(printf '%s' "$NCCL_IB_HCA" | tr ',' '\n' | sed 's/^[=^]*//; s/:.*$//' | grep .)
+for fabric_dev in $fabric_devices; do
+  fabric_sys=/sys/class/infiniband/$fabric_dev/ports/1
+  [ -d "$fabric_sys" ] \
+    || die "RDMA device $fabric_dev (NCCL_IB_HCA) does not exist on this host (ibv_devices / rdma link show)"
+  fabric_gid=$(cat "$fabric_sys/gids/$NCCL_IB_GID_INDEX" 2>/dev/null || true)
+  fabric_type=$(cat "$fabric_sys/gid_attrs/types/$NCCL_IB_GID_INDEX" 2>/dev/null || true)
+  case "$fabric_gid" in
+    0000:0000:0000:0000:0000:ffff:*) ;;
+    *) die "$fabric_dev has no IPv4 GID at index $NCCL_IB_GID_INDEX (got '${fabric_gid:-none}'): give its netdev an IPv4 in its own /24 (ls /sys/class/infiniband/$fabric_dev/device/net/), then re-check with show_gids" ;;
+  esac
+  case "$fabric_type" in
+    *"v2"*) ;;
+    *) die "$fabric_dev GID index $NCCL_IB_GID_INDEX is '${fabric_type:-unknown}', not RoCE v2" ;;
+  esac
+done
+
+# RoCEnante device list: empty follows NCCL_IB_HCA (b12x strips =/^ and :port
+# and keeps at most two). If set, it must name the same devices -- a split
+# between NCCL and RoCEnante hides which path a regression came from.
+if [ -n "$B12X_ROCE_HCA" ]; then
+  roce_devices=$(printf '%s' "$B12X_ROCE_HCA" | tr ',' '\n' | sed 's/^[=^]*//; s/:.*$//' | grep . | LC_ALL=C sort | tr '\n' ' ')
+  nccl_devices=$(printf '%s\n' "$fabric_devices" | LC_ALL=C sort | tr '\n' ' ')
+  [ "$roce_devices" = "$nccl_devices" ] \
+    || die "B12X_ROCE_HCA ($B12X_ROCE_HCA) must name the same devices as NCCL_IB_HCA ($NCCL_IB_HCA), or be empty to follow it"
+fi
 
 # RoCEnante: b12x one-shot RoCE collectives for small TP all-reduces and
 # all-gathers, with NCCL keeping everything above the cutoffs. Pair-level, so
@@ -988,7 +1103,7 @@ case "$FUSE_ACT_QUANT" in
   1) pass_config_json=',"pass_config":{"fuse_act_quant":true}' ;;
   0) pass_config_json=',"pass_config":{"fuse_act_quant":false}' ;;
 esac
-compilation_config=$(printf '{"cudagraph_mode":"%s","custom_ops":["all"]%s}' "$CUDAGRAPH_MODE" "$pass_config_json")
+compilation_config=$(printf '{"cudagraph_mode":"%s","custom_ops":["all"]%s%s}' "$CUDAGRAPH_MODE" "$pass_config_json" "$capture_sizes_json")
 
 # Optional serve flags. Each is omitted unless configured, because an unknown
 # CLI flag is a hard argparse failure at exec on an image that predates it.
@@ -1244,7 +1359,8 @@ printf '  cache:                   %s\n' "$CACHE_HOST_PATH"
 printf '  MAX_MODEL_LEN:           %s\n' "$MAX_MODEL_LEN"
 printf '  MAX_NUM_SEQS:            %s\n' "$MAX_NUM_SEQS"
 printf '  MAX_NUM_BATCHED_TOKENS:  %s\n' "$MAX_NUM_BATCHED_TOKENS"
-printf '  SPECULATOR:              %s (%s draft tokens%s)\n' "$SPECULATOR" "$NUM_SPECULATIVE_TOKENS" \
+printf '  SPECULATOR:              %s (%s draft tokens, %s draft sampling, %s rejection%s)\n' "$SPECULATOR" "$NUM_SPECULATIVE_TOKENS" \
+  "$DRAFT_SAMPLE_METHOD" "$REJECTION_SAMPLE_METHOD" \
   "$([ "$ADAPTIVE_SPECULATIVE_TOKENS" = 1 ] && printf ', adaptive from %s' "$ADAPTIVE_SPECULATIVE_TOKENS_INITIAL")"
 printf '  KV_CACHE_MEMORY_BYTES:   %s (%s)\n' \
   "${KV_CACHE_MEMORY_BYTES:-profiled at $GPU_MEMORY_UTILIZATION}" "$KV_CACHE_DTYPE"
@@ -1262,12 +1378,12 @@ if [ "$MODEL_MULTIMODAL" = 1 ]; then
 fi
 printf '  RoCEnante:               %s\n' \
   "$([ "${VLLM_ENABLE_ROCE_ALLREDUCE:-0}" = 1 ] && echo "on (<= ${VLLM_ROCE_ALLREDUCE_MAX_SIZE:-default} B)" || echo 'off (NCCL for all collectives)')"
-printf '  CUDAGRAPH_MODE:          %s (capture %s)\n' "$CUDAGRAPH_MODE" "$MAX_CUDAGRAPH_CAPTURE_SIZE"
+printf '  CUDAGRAPH_MODE:          %s (capture %s: %s)\n' "$CUDAGRAPH_MODE" "$MAX_CUDAGRAPH_CAPTURE_SIZE" "${CUDAGRAPH_CAPTURE_SIZES:-engine default grid}"
 printf '  compilation-config:      %s\n' "$compilation_config"
 printf '  target LM head:          %s\n' "$([ "$VLLM_MXFP8_LM_HEAD" = 1 ] && echo 'MXFP8 online (A/B)' || echo 'BF16 (qualified)')"
 printf '  LOAD_FORMAT:             %s\n' "$LOAD_FORMAT"
 printf '  seccomp:                 %s\n' "$seccomp_desc"
-printf '  fabric profile:          %s-rail (%s)\n' "$FABRIC_PROFILE" "$NCCL_IB_HCA"
+printf '  fabric profile:          %s (NCCL %s; RoCEnante %s)\n' "$FABRIC_PROFILE" "$NCCL_IB_HCA" "${B12X_ROCE_HCA:-follows NCCL_IB_HCA}"
 [ "${#extra_args[@]}" -eq 0 ] || printf '  optional flags:          %s\n' "${extra_args[*]}"
 [ -z "$CONTAINER_MEMORY_GB" ] || printf '  container memory cap:    %s GiB\n' "$CONTAINER_MEMORY_GB"
 [ -z "$TORCH_PROFILE_HOST_DIR" ] || printf '  torch profiler dir:      %s\n' "$TORCH_PROFILE_HOST_DIR"
