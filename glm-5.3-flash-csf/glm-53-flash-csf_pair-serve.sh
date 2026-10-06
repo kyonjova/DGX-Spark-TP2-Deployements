@@ -787,7 +787,7 @@ case "${VLLM_GLM53_MTP_DRAFT_HEAD:-bf16}" in
 esac
 if [ "${VLLM_GLM53_L2_PREFETCH:-}" = 1 ]; then
   [ -n "${VLLM_GLM53_L2_PREFETCH_BUDGET_B_MB:-}" ] \
-    || warn "VLLM_GLM53_L2_PREFETCH=1 with the default 50 MB window B: larger than GB10's 24 MB L2. Set VLLM_GLM53_L2_PREFETCH_BUDGET_{A,B,C}_MB (e.g. 20/16/15) for the A/B"
+    || warn "VLLM_GLM53_L2_PREFETCH=1 with the default 50 MB window B: larger than GB10's 24 MB L2. Set VLLM_GLM53_L2_PREFETCH_BUDGET_{A,B,C,A_MLA}_MB (e.g. 20/16/15/16) for the A/B"
 fi
 # Unified memory: pinned host RAM IS the GPU's memory on GB10, so the
 # release's embedding-in-host-RAM saving does not exist here; it only adds
