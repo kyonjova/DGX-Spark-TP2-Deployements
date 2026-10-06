@@ -29,7 +29,14 @@
 #     checks, as in the Qwen launcher.
 #   * CUDAGRAPH_CAPTURE_SIZES / MAX_CUDAGRAPH_CAPTURE_SIZE auto: capture
 #     exactly the decode shapes MTP/DFlash produce.
-#   * No external prefix cache (SparkCache / LMCache): GPU prefix caching only.
+#   * External prefix cache (env section 8, PREFIX_CACHE=none|sparkcache|
+#     lmcache), ported from the glm-5.3-flash-cache launcher: builds
+#     --kv-transfer-config, mounts PREFIX_CACHE_HOST_PATH at /prefix-cache,
+#     and for lmcache starts a CPU-only sidecar (<name>-lmcache) before vLLM
+#     and waits for its health check. Differences from the cache launcher:
+#     the cache identity defaults to the CSF checkpoint identity (manifest
+#     digest), the namespace includes DCP_SIZE, and REPLAYSSM is forced to 0
+#     (1 is refused) whenever a connector is on. Default none = Z1F.
 #
 # Usage:
 #     ./glm-53-flash-csf_pair-serve.sh --check   rank-0.env
@@ -171,12 +178,15 @@ container_down() {
   else
     printf 'no such container: %s\n' "$mgmt_container"
   fi
-  # A leftover LMCache sidecar from the glm-5.3-flash-cache launcher would
-  # hold /dev/shm and host RAM; remove it too.
+  # PREFIX_CACHE=lmcache sidecar (this launcher's or the glm-5.3-flash-cache
+  # launcher's): stopped AFTER vLLM so in-flight stores and restores drain
+  # into a live server. Removed whatever PREFIX_CACHE says now -- it holds
+  # /dev/shm and host RAM.
   if "$CONTAINER_RUNTIME" container inspect "${mgmt_container}-lmcache" >/dev/null 2>&1; then
-    printf 'stopping leftover %s\n' "${mgmt_container}-lmcache"
+    printf 'stopping %s\n' "${mgmt_container}-lmcache"
     "$CONTAINER_RUNTIME" stop -t 10 "${mgmt_container}-lmcache" >/dev/null
     "$CONTAINER_RUNTIME" rm "${mgmt_container}-lmcache" >/dev/null
+    printf 'removed %s\n' "${mgmt_container}-lmcache"
   fi
 }
 
@@ -247,7 +257,7 @@ case "$mode" in
     ;;
   --status)
     require_runtime
-    "$CONTAINER_RUNTIME" ps -a --filter "name=^/${mgmt_container}$" \
+    "$CONTAINER_RUNTIME" ps -a --filter "name=^/${mgmt_container}(-lmcache)?$" \
       --format 'table {{.Names}}\t{{.Status}}\t{{.RunningFor}}'
     exit 0
     ;;
@@ -383,6 +393,20 @@ require_unit_fraction() {
 : "${VLLM_USE_FASTOKENS:=0}"
 : "${CHECKPOINT_MANIFEST_SHA256:=}"
 : "${MEM_PREFLIGHT:=die}"
+: "${PREFIX_CACHE:=none}"                # none | sparkcache | lmcache (env section 8)
+: "${PREFIX_CACHE_HOST_PATH:=}"
+: "${PREFIX_CACHE_DISK_GB:=200}"
+: "${PREFIX_CACHE_MODEL_IDENTITY:=auto}"
+: "${PREFIX_CACHE_SPARK_MIN_SPAN_TOKENS:=4096}"
+: "${PREFIX_CACHE_SPARK_MAX_SPAN_TOKENS:=262144}"
+: "${PREFIX_CACHE_SPARK_ACCESS_MODE:=read-write}"
+: "${PREFIX_CACHE_SPARK_LOAD_THREADS:=1}"
+: "${PREFIX_CACHE_SPARK_SHARED_PREFIX_TTL:=}"
+: "${PREFIX_CACHE_LMC_L1_GB:=2}"
+: "${PREFIX_CACHE_LMC_PORT:=}"
+: "${PREFIX_CACHE_LMC_RANK1_ADDR:=}"
+: "${PREFIX_CACHE_LMC_L2_WORKERS:=4}"
+: "${PREFIX_CACHE_LMC_CPU_WORKERS:=4}"
 
 case "$SPECULATOR" in
   mtp)     : "${NUM_SPECULATIVE_TOKENS:=3}" ;;
@@ -1109,6 +1133,211 @@ fi
 profile_env_args=()
 [ -z "$TORCH_PROFILE_HOST_DIR" ] || profile_env_args=(-e VLLM_TORCH_PROFILER_DIR=/profiles)
 
+# ===== BEGIN prefix cache (PREFIX_CACHE: none | sparkcache | lmcache) =====
+# Ported from glm-5.3-flash-cache_pair-serve.sh. Builds --kv-transfer-config
+# and the extra serve flags, mounts the per-node NVMe directory, and
+# (lmcache) describes the CPU-only lmcache server container started before
+# vLLM in --run. See env section 8. CSF deltas: cache identity = the CSF
+# checkpoint identity, DCP_SIZE in the namespace, REPLAYSSM forced to 0.
+prefix_cache_desc="none (GPU prefix cache only, ${RECURRENT_CHECKPOINT_POLICY:-auto})"
+lmc_server_cmd=()
+lmc_container="${mgmt_container}-lmcache"
+lmc_health_url=""
+case "$PREFIX_CACHE" in
+  none) ;;
+  sparkcache|lmcache)
+    [ -n "$PREFIX_CACHE_HOST_PATH" ] || die "PREFIX_CACHE=$PREFIX_CACHE needs PREFIX_CACHE_HOST_PATH (a directory on this node's NVMe)"
+    case "$PREFIX_CACHE_HOST_PATH" in /*) ;; *) die "PREFIX_CACHE_HOST_PATH must be absolute: $PREFIX_CACHE_HOST_PATH" ;; esac
+    PREFIX_CACHE_HOST_PATH=${PREFIX_CACHE_HOST_PATH%/}
+    case "$PREFIX_CACHE_HOST_PATH/" in
+      "${CACHE_HOST_PATH%/}"/*) die "PREFIX_CACHE_HOST_PATH must not be inside CACHE_HOST_PATH (--clear wipes the JIT cache): $PREFIX_CACHE_HOST_PATH" ;;
+      "${MODEL_HOST_PATH%/}"/*) die "PREFIX_CACHE_HOST_PATH must not be inside MODEL_HOST_PATH: $PREFIX_CACHE_HOST_PATH" ;;
+    esac
+    mkdir -p "$PREFIX_CACHE_HOST_PATH" 2>/dev/null || true
+    [ -d "$PREFIX_CACHE_HOST_PATH" ] && [ -w "$PREFIX_CACHE_HOST_PATH" ] || die "PREFIX_CACHE_HOST_PATH is not a writable directory: $PREFIX_CACHE_HOST_PATH"
+    require_positive_integer PREFIX_CACHE_DISK_GB
+    [ "$ENABLE_PREFIX_CACHING" = 1 ] || die "PREFIX_CACHE=$PREFIX_CACHE needs ENABLE_PREFIX_CACHING=1"
+
+    # GLM KDA speculative recovery requires an atomic request-boundary
+    # connector (vLLM: "GLM KDA recovery requires an atomic request-boundary
+    # external-cache connector"); neither connector here is one.
+    [ "$REPLAYSSM" != 1 ] || die "REPLAYSSM=1 with PREFIX_CACHE=$PREFIX_CACHE: GLM KDA recovery needs a request-boundary connector; set REPLAYSSM= (the launcher then passes --no-use-replayssm) or 0"
+    [ "$REPLAYSSM" = 0 ] || extra_args+=(--no-use-replayssm)
+    [ "$DCP_SIZE" = 1 ] \
+      || warn "PREFIX_CACHE=$PREFIX_CACHE with DCP_SIZE=$DCP_SIZE: no connector has been run with decode context parallelism on this pair (the release qualifies TP2 external cache at DCP1 only)"
+
+    # Cache identity of the target: explicit 64-hex, or auto = the CSF
+    # checkpoint identity printed above (sha256 over manifest.json, which
+    # names every shard and metadata file by size/sha256).
+    if [ "$PREFIX_CACHE_MODEL_IDENTITY" = auto ]; then
+      pc_target=$csf_identity
+    else
+      printf '%s' "$PREFIX_CACHE_MODEL_IDENTITY" | grep -Eq '^[0-9a-f]{64}$' \
+        || die "PREFIX_CACHE_MODEL_IDENTITY must be auto or 64 lowercase hex: $PREFIX_CACHE_MODEL_IDENTITY"
+      pc_target=$PREFIX_CACHE_MODEL_IDENTITY
+    fi
+    # Serving layout: anything that changes the bytes of a stored page or
+    # the meaning of a boundary gets its own namespace directory.
+    pc_layout=$(printf '%s|' "$PREFIX_CACHE" tp2 "dcp$DCP_SIZE" "$BLOCK_SIZE" "$KV_CACHE_DTYPE" \
+      "${VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE:-coupled}" "${VLLM_GLM53_SPLIT_MAMBA_BLOCK_SIZE:-coupled}" \
+      "$RECURRENT_CHECKPOINT_POLICY" "$SPECULATOR" "$NUM_SPECULATIVE_TOKENS" "$MAX_NUM_BATCHED_TOKENS" \
+      | sha256sum | cut -c1-12)
+    pc_namespace="/prefix-cache/$PREFIX_CACHE/${pc_target:0:16}-$pc_layout"
+    mount_args+=(-v "$PREFIX_CACHE_HOST_PATH:/prefix-cache")
+    pc_disk_bytes=$(( PREFIX_CACHE_DISK_GB * 1024 * 1024 * 1024 ))
+
+    # Image capability check (only when the image is present locally).
+    pc_image_label() { "$CONTAINER_RUNTIME" image inspect --format "{{index .Config.Labels \"$1\"}}" "$SERVING_IMAGE" 2>/dev/null || true; }
+    pc_have_image=0
+    if [ "${SKIP_IMAGE_CHECKS:-0}" != 1 ] && command -v "$CONTAINER_RUNTIME" >/dev/null 2>&1 \
+       && "$CONTAINER_RUNTIME" image inspect "$SERVING_IMAGE" >/dev/null 2>&1; then
+      pc_have_image=1
+    fi
+    ;;
+  *) die "PREFIX_CACHE must be none, sparkcache, or lmcache: $PREFIX_CACHE" ;;
+esac
+
+if [ "$PREFIX_CACHE" = sparkcache ]; then
+  if [ "$pc_have_image" = 1 ]; then
+    pc_sc_patches=$(pc_image_label org.local-inference.sparkcache.vllm-patches)
+    case "$pc_sc_patches" in
+      *vmm-exemption*) : ;;
+      *) die "PREFIX_CACHE=sparkcache: $SERVING_IMAGE carries no SparkCache vmm-exemption patch (label: '${pc_sc_patches:-none}'); vLLM would refuse the connector under expandable_segments. Rebuild with PATCH_SPARKCACHE=on" ;;
+    esac
+    if [ -n "$PREFIX_CACHE_SPARK_SHARED_PREFIX_TTL" ]; then
+      case "$pc_sc_patches" in *shared-prefix*) : ;; *) warn "PREFIX_CACHE_SPARK_SHARED_PREFIX_TTL is set but the image has no shared-prefix-lease patch; the setting has no effect" ;; esac
+    fi
+  fi
+  [ "$RECURRENT_CHECKPOINT_POLICY" = aligned ] \
+    || warn "PREFIX_CACHE=sparkcache with RECURRENT_CHECKPOINT_POLICY=${RECURRENT_CHECKPOINT_POLICY:-auto}: SparkCache stores 256-token boundaries and needs a KDA state at each; with request boundaries almost nothing is storable. Set aligned"
+  for name in PREFIX_CACHE_SPARK_MIN_SPAN_TOKENS PREFIX_CACHE_SPARK_MAX_SPAN_TOKENS; do
+    require_positive_integer "$name"
+    [ $(( ${!name} % 256 )) -eq 0 ] || die "$name must be a multiple of 256: ${!name}"
+  done
+  [ "$PREFIX_CACHE_SPARK_MAX_SPAN_TOKENS" -ge "$PREFIX_CACHE_SPARK_MIN_SPAN_TOKENS" ] \
+    || die "PREFIX_CACHE_SPARK_MAX_SPAN_TOKENS must be >= PREFIX_CACHE_SPARK_MIN_SPAN_TOKENS"
+  case "$PREFIX_CACHE_SPARK_ACCESS_MODE" in read-write|restore-only|store-only|disabled) : ;; *) die "PREFIX_CACHE_SPARK_ACCESS_MODE must be read-write, restore-only, store-only, or disabled: $PREFIX_CACHE_SPARK_ACCESS_MODE" ;; esac
+  case "$PREFIX_CACHE_SPARK_LOAD_THREADS" in [1-8]) : ;; *) die "PREFIX_CACHE_SPARK_LOAD_THREADS must be 1-8: $PREFIX_CACHE_SPARK_LOAD_THREADS" ;; esac
+  if [ -n "$PREFIX_CACHE_SPARK_SHARED_PREFIX_TTL" ]; then
+    awk -v v="$PREFIX_CACHE_SPARK_SHARED_PREFIX_TTL" 'BEGIN{ exit !(v ~ /^[0-9]*\.?[0-9]+$/ && v+0 >= 1 && v+0 <= 300) }' \
+      || die "PREFIX_CACHE_SPARK_SHARED_PREFIX_TTL must be 1-300 seconds: $PREFIX_CACHE_SPARK_SHARED_PREFIX_TTL"
+  fi
+  # Draft identity (SparkCache recomputes draft state after a restore, but
+  # binds entries to the draft so a speculator change is a clean miss).
+  # Formulas follow sparkcache deploy/glm53_flash/profile.py.
+  case "$SPECULATOR" in
+    mtp)
+      if [ "$ADAPTIVE_SPECULATIVE_TOKENS" = 1 ]; then
+        pc_policy="adaptive:${ADAPTIVE_SPECULATIVE_TOKENS_INITIAL}:${ADAPTIVE_SPECULATIVE_TOKENS_WINDOW}"
+      else
+        pc_policy=static
+      fi
+      pc_draft=$(printf 'glm53-embedded-mtp-v1\0%s\0%s\0%s' "$pc_target" "$NUM_SPECULATIVE_TOKENS" "$pc_policy" | sha256sum | cut -d' ' -f1)
+      pc_draft_json=$(printf ',"spark_cache_draft_policy":"separate","spark_cache_draft_checkpoint_sha256":"%s"' "$pc_draft") ;;
+    dflash2)
+      [ -n "$DFLASH_WEIGHTS_SHA256" ] || die "PREFIX_CACHE=sparkcache with SPECULATOR=dflash2 needs DFLASH_WEIGHTS_SHA256 (the draft's cache identity)"
+      pc_draft_json=$(printf ',"spark_cache_draft_policy":"separate","spark_cache_draft_checkpoint_sha256":"%s"' "$DFLASH_WEIGHTS_SHA256") ;;
+    *) pc_draft_json=',"spark_cache_draft_policy":"colocated_target"' ;;
+  esac
+  pc_low_bytes=$(( pc_disk_bytes / 10 * 9 ))
+  pc_extra=$(printf '"spark_cache_root":"%s","spark_cache_model_profile":"glm53-flash-hybrid","spark_cache_target_checkpoint_sha256":"%s"%s,"spark_cache_access_mode":"%s","spark_cache_publication_schema":"snapshot-v1","spark_cache_scheduler_probe":"none","spark_cache_streaming_snapshots":false,"spark_cache_cuda_restore":false,"spark_cache_max_bytes":%s,"spark_cache_low_watermark_bytes":%s,"spark_cache_ttl_seconds":0,"spark_cache_min_span_tokens":%s,"spark_cache_max_span_tokens":%s,"spark_cache_load_threads":%s' \
+    "$pc_namespace" "$pc_target" "$pc_draft_json" "$PREFIX_CACHE_SPARK_ACCESS_MODE" "$pc_disk_bytes" "$pc_low_bytes" \
+    "$PREFIX_CACHE_SPARK_MIN_SPAN_TOKENS" "$PREFIX_CACHE_SPARK_MAX_SPAN_TOKENS" "$PREFIX_CACHE_SPARK_LOAD_THREADS")
+  [ -z "$PREFIX_CACHE_SPARK_SHARED_PREFIX_TTL" ] || pc_extra="$pc_extra,\"spark_cache_shared_prefix_lease_ttl_seconds\":$PREFIX_CACHE_SPARK_SHARED_PREFIX_TTL"
+  pc_kv_transfer=$(printf '{"kv_connector":"SparkContextCacheConnector","kv_connector_module_path":"sparkcache.spark_context_cache_connector","kv_role":"kv_both","kv_load_failure_policy":"recompute","kv_connector_extra_config":{%s}}' "$pc_extra")
+  extra_args+=(--kv-transfer-config "$pc_kv_transfer")
+  # Host-RAM transient: one staged snapshot per load lane, <= ~7.5 KB/token.
+  pc_ram_gib=$(awk -v t="$PREFIX_CACHE_SPARK_MAX_SPAN_TOKENS" -v n="$PREFIX_CACHE_SPARK_LOAD_THREADS" 'BEGIN{printf "%.1f", t*7500*n/1073741824}')
+  prefix_cache_desc="sparkcache -> $PREFIX_CACHE_HOST_PATH (${PREFIX_CACHE_DISK_GB} GiB, spans ${PREFIX_CACHE_SPARK_MIN_SPAN_TOKENS}-${PREFIX_CACHE_SPARK_MAX_SPAN_TOKENS} tokens, ${PREFIX_CACHE_SPARK_ACCESS_MODE}; RAM transient <= ~${pc_ram_gib} GiB/node, take it off the KV pin)"
+fi
+
+if [ "$PREFIX_CACHE" = lmcache ]; then
+  if [ "$pc_have_image" = 1 ] && [ -z "$(pc_image_label local-inference.lmcache.commit)" ]; then
+    warn "PREFIX_CACHE=lmcache: $SERVING_IMAGE has no local-inference.lmcache.commit label; multi-server LMCacheMPConnector needs the integration/local-inference-lab LMCache (PATCH_LMCACHE_INTEGRATION)"
+  fi
+  # GLM's request-boundary bundles need LMCacheRecurrentCheckpointConnector,
+  # which publishes a bundle only when every rank acks the SAME server --
+  # impossible with one server per node. Aligned chunks carry their own KDA
+  # state and the multi-server MP connector handles them.
+  [ "$RECURRENT_CHECKPOINT_POLICY" = aligned ] \
+    || die "PREFIX_CACHE=lmcache requires RECURRENT_CHECKPOINT_POLICY=aligned on a two-node pair (request-boundary bundles cannot span two lmcache servers)"
+  require_positive_integer PREFIX_CACHE_LMC_L1_GB
+  require_positive_integer PREFIX_CACHE_LMC_L2_WORKERS
+  require_positive_integer PREFIX_CACHE_LMC_CPU_WORKERS
+  [ -n "$PREFIX_CACHE_LMC_RANK1_ADDR" ] || die "PREFIX_CACHE=lmcache needs PREFIX_CACHE_LMC_RANK1_ADDR (rank 1's CX7 IPv4, identical in both files)"
+  [ "$NODE_RANK" != 1 ] || [ "$PREFIX_CACHE_LMC_RANK1_ADDR" = "$VLLM_HOST_IP" ] \
+    || die "PREFIX_CACHE_LMC_RANK1_ADDR ($PREFIX_CACHE_LMC_RANK1_ADDR) must equal rank 1's VLLM_HOST_IP ($VLLM_HOST_IP)"
+  [ "$PREFIX_CACHE_LMC_RANK1_ADDR" != "$MASTER_ADDR" ] || die "PREFIX_CACHE_LMC_RANK1_ADDR must be rank 1's address, not MASTER_ADDR"
+  pc_port=${PREFIX_CACHE_LMC_PORT:-$(( API_PORT + 10000 ))}
+  require_port pc_port
+  [ $(( pc_port + 2 )) -le 65535 ] || die "PREFIX_CACHE_LMC_PORT + 2 exceeds 65535: $pc_port"
+  for p in "$pc_port" $(( pc_port + 1 )) $(( pc_port + 2 )); do
+    [ "$p" != "$API_PORT" ] && [ "$p" != "$MASTER_PORT" ] || die "lmcache ports ($pc_port..$(( pc_port + 2 ))) collide with API_PORT/MASTER_PORT"
+  done
+  # LIL's GLM contract: a cache object is exactly one scheduler budget, and
+  # must hold whole target pages.
+  pc_chunk=$MAX_NUM_BATCHED_TOKENS
+  if [ -n "${VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE:-}" ] && [ "$VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE" != auto ]; then
+    [ $(( pc_chunk % VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE )) -eq 0 ] \
+      || die "PREFIX_CACHE=lmcache: MAX_NUM_BATCHED_TOKENS ($pc_chunk) must be a multiple of VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE ($VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE)"
+  fi
+  if [ -d /dev/shm ]; then
+    pc_shm_mb=$(df -Pm /dev/shm 2>/dev/null | awk 'NR==2{print $2}')
+    case "$pc_shm_mb" in ''|*[!0-9]*) ;; *) [ "$pc_shm_mb" -ge $(( PREFIX_CACHE_LMC_L1_GB * 1024 + 1024 )) ] || die "/dev/shm is ${pc_shm_mb} MiB; lmcache L1 (${PREFIX_CACHE_LMC_L1_GB} GiB) lives there (--ipc host) with ~1 GiB spare" ;; esac
+  fi
+  pc_shm_suffix="glm53-r${NODE_RANK}-${pc_port}"
+  pc_l2=$(printf '{"type":"fs_native","base_path":"%s","num_workers":%s,"use_odirect":false,"max_capacity_gb":%s,"eviction":{"eviction_policy":"LRU","trigger_watermark":0.8,"eviction_ratio":0.2}}' \
+    "$pc_namespace" "$PREFIX_CACHE_LMC_L2_WORKERS" "$PREFIX_CACHE_DISK_GB")
+  lmc_health_url="http://127.0.0.1:$(( pc_port + 1 ))/healthcheck"
+  # CPU-only service: no GPUs, CUDA hidden. Same image (the lmcache CLI and
+  # its torch live there), host network/IPC so vLLM maps the L1 SHM pool.
+  lmc_server_cmd=(
+    "$CONTAINER_RUNTIME" run -d
+    --name "$lmc_container"
+    --pull never
+    --network host
+    --ipc host
+    --ulimit memlock=-1:-1
+    --stop-timeout 10
+    -v "$PREFIX_CACHE_HOST_PATH:/prefix-cache"
+    -e CUDA_VISIBLE_DEVICES=
+    -e CUDA_MODULE_LOADING=LAZY
+    -e LD_PRELOAD="$LD_PRELOAD"
+    --entrypoint /opt/venv/bin/lmcache
+    "$SERVING_IMAGE"
+    server
+    --instance-id "glm53-r${NODE_RANK}"
+    --host "$VLLM_HOST_IP" --port "$pc_port"
+    --http-host 127.0.0.1 --http-port $(( pc_port + 1 ))
+    --prometheus-port $(( pc_port + 2 ))
+    --chunk-size "$pc_chunk"
+    --supported-transfer-mode engine_driven
+    --separate-object-groups
+    --l1-size-gb "$PREFIX_CACHE_LMC_L1_GB" --l1-init-size-gb "$PREFIX_CACHE_LMC_L1_GB"
+    --no-l1-use-lazy --shm-name "$pc_shm_suffix"
+    --max-gpu-workers 1 --max-cpu-workers "$PREFIX_CACHE_LMC_CPU_WORKERS"
+    --eviction-policy LRU --l2-prefetch-policy retain --emergency-evict-for-prefetch
+    --hash-algorithm blake3 --max-workers 8
+    --l2-adapter "$pc_l2"
+  )
+  pc_kv_transfer=$(printf '{"kv_connector":"LMCacheMPConnector","kv_connector_module_path":"lmcache.integration.vllm.lmcache_mp_connector","kv_role":"kv_both","kv_load_failure_policy":"recompute","kv_connector_extra_config":{"lmcache.mp.server_urls":["tcp://%s:%s","tcp://%s:%s"],"lmcache.mp.mp_transfer_mode":"engine_driven"}}' \
+    "$MASTER_ADDR" "$pc_port" "$PREFIX_CACHE_LMC_RANK1_ADDR" "$pc_port")
+  extra_args+=(--kv-transfer-config "$pc_kv_transfer" --prefix-cache-retention-interval "$pc_chunk")
+  prefix_cache_desc="lmcache -> $PREFIX_CACHE_HOST_PATH (L1 ${PREFIX_CACHE_LMC_L1_GB} GiB shm pinned/node -- take it off the KV pin; L2 ${PREFIX_CACHE_DISK_GB} GiB, chunk ${pc_chunk}, servers ${MASTER_ADDR}+${PREFIX_CACHE_LMC_RANK1_ADDR}:${pc_port})"
+  pc_ram_gib=$PREFIX_CACHE_LMC_L1_GB
+fi
+
+# KV-pin budget. Z1F's pin (19377663936) leaves rank 0 ~3.3 GiB MemAvailable
+# at its lowest under the full bench; the floor is 3 GiB. A connector adds
+# its host RAM (lmcache L1, sparkcache staging) plus the REPLAYSSM=0
+# reservation (~188 MiB/rank) to the same unified pool.
+if [ "$PREFIX_CACHE" != none ] && [ -n "$KV_CACHE_MEMORY_BYTES" ]; then
+  pc_pin_max=$(awk -v ref=19377663936 -v g="$pc_ram_gib" 'BEGIN{printf "%d", ref - (g + 0.2) * 1073741824}')
+  [ "$KV_CACHE_MEMORY_BYTES" -le "$pc_pin_max" ] \
+    || warn "PREFIX_CACHE=$PREFIX_CACHE adds ~${pc_ram_gib} GiB host RAM + ~0.2 GiB (REPLAYSSM=0) to the unified pool; KV_CACHE_MEMORY_BYTES=$KV_CACHE_MEMORY_BYTES would take rank 0 below the 3 GiB floor measured at the Z1F pin. Use <= $pc_pin_max and re-check MemAvailable under load"
+fi
+# ===== END prefix cache =====
+
 command=(
   "$CONTAINER_RUNTIME" run -d
   --name "$container_name"
@@ -1217,7 +1446,7 @@ fi
 printf '  KV_CACHE_MEMORY_BYTES:   %s (%s)\n' "${KV_CACHE_MEMORY_BYTES:-profiled at $GPU_MEMORY_UTILIZATION}" "$KV_CACHE_DTYPE"
 printf '  GPU_MEMORY_UTILIZATION:  %s (startup gate%s)\n' "$GPU_MEMORY_UTILIZATION" "$([ -n "$KV_CACHE_MEMORY_BYTES" ] && echo '; the pin sizes the pool')"
 printf '  CUDAGRAPH_MODE:          %s (capture max %s: %s)\n' "$CUDAGRAPH_MODE" "$MAX_CUDAGRAPH_CAPTURE_SIZE" "${CUDAGRAPH_CAPTURE_SIZES:-engine default grid}"
-printf '  prefix cache:            GPU only (%s)\n' "${RECURRENT_CHECKPOINT_POLICY:-auto}"
+printf '  prefix cache:            %s\n' "$prefix_cache_desc"
 printf '  fabric profile:          %s (NCCL %s; RoCEnante %s)\n' "$FABRIC_PROFILE" "$NCCL_IB_HCA" "${B12X_ROCE_HCA:-follows NCCL_IB_HCA}"
 printf '  collectives:             %s\n' "$roce_desc"
 printf '  tokenizer backend:       %s\n' "$([ "$VLLM_USE_FASTOKENS" = 1 ] && echo fastokens || echo 'HF tokenizers (standard)')"
@@ -1226,6 +1455,11 @@ printf '  API_KEY:                 %s\n' "$([ -n "$API_KEY" ] && echo 'set (Bear
 printf '  command:'
 printf ' %q' "${command[@]}"
 printf '\n'
+if [ "${#lmc_server_cmd[@]}" -gt 0 ]; then
+  printf '  lmcache server:'
+  printf ' %q' "${lmc_server_cmd[@]}"
+  printf '\n'
+fi
 
 [ "$mode" = --run ] || exit 0
 
@@ -1236,6 +1470,29 @@ require_runtime
   || die "pinned image is not present; build or load it before launching: $SERVING_IMAGE"
 if "$CONTAINER_RUNTIME" container inspect "$container_name" >/dev/null 2>&1; then
   die "container already exists; remove it intentionally before relaunch: $container_name"
+fi
+
+# PREFIX_CACHE=lmcache: the node-local server must answer before vLLM's
+# connector connects (and, on rank 1, before rank 0 starts: rank 0's
+# scheduler queries both servers). Start rank 1 first, as always.
+if [ "${#lmc_server_cmd[@]}" -gt 0 ]; then
+  command -v curl >/dev/null 2>&1 || die "PREFIX_CACHE=lmcache needs curl on the host for the lmcache server health check"
+  if "$CONTAINER_RUNTIME" container inspect "$lmc_container" >/dev/null 2>&1; then
+    die "container already exists; remove it intentionally before relaunch (--down removes both): $lmc_container"
+  fi
+  "${lmc_server_cmd[@]}" >/dev/null
+  printf 'waiting for %s (%s) ' "$lmc_container" "$lmc_health_url"
+  pc_deadline=$(( $(date +%s) + ${PREFIX_CACHE_LMC_START_TIMEOUT:-120} ))
+  until curl -fsS "$lmc_health_url" >/dev/null 2>&1; do
+    if ! "$CONTAINER_RUNTIME" container inspect -f '{{.State.Running}}' "$lmc_container" 2>/dev/null | grep -q true \
+       || [ "$(date +%s)" -ge "$pc_deadline" ]; then
+      printf 'FAILED\n'
+      "$CONTAINER_RUNTIME" logs --tail 40 "$lmc_container" >&2 || true
+      die "lmcache server did not become healthy; container left for inspection: $lmc_container (--down removes it)"
+    fi
+    printf '.'; sleep 2
+  done
+  printf ' ready\n'
 fi
 
 if [ "$fresh_follow" = 1 ]; then
