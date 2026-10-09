@@ -4,21 +4,43 @@
 # Validate or start one rank of a two-node DGX Spark pair serving
 # local-inference-lab/GLM-5.3-Flash-NVFP4-MXFP8-CSF-QAD (NVFP4 QAD routed
 # experts with losslessly compressed scales, MXFP8 attention and shared
-# experts, NVFP4 MTP experts) at TP=2 under the karmic-kraken INTEGRATION
-# image (build-kk-integration-cache-cu132.env: vLLM f1c2508f + b12x 52640cb1,
-# CuTe DSL 4.7.1).
+# experts, NVFP4 MTP experts) at TP=2 under a karmic-kraken image built by
+# dgx-spark-builder/build-spark-cache-cu132.sh. Two image generations, told
+# apart by probing the image (not by its tag):
+#   recipe CSF   build-kk-integration-cache-cu132.env (2026-10-08) ->
+#                karmic-kraken-intcache1008-cu132, the default SERVING_IMAGE:
+#                vLLM integration/karmic-kraken-beta 19f2c20e on FlashInfer
+#                0.7.1 with B12X inside. CSF is read through ModelOpt recipes
+#                (--quantization modelopt_mixed --load-format LOAD_FORMAT,
+#                default b12x = vLLM's native b12x loader); A4 prefill is the
+#                semantic hybrid switch B12X_W4A16_A4_PREFILL.
+#   nvfp4_csf    Z1F's image, karmic-kraken-integration-cache-cu132 (vLLM
+#                f1c2508f + standalone b12x; the fallback). Dedicated
+#                nvfp4_csf loader (InstantTensor inside); A4 prefill by token
+#                threshold.
 #
 # What is different from the glm-5.3-flash-cache launcher:
-#   * FP4-CSF serving directory. The checkpoint keeps the Hugging Face files
-#     under metadata/ and the compressed tensors under tensors/. vLLM cannot
-#     open that layout directly: it needs a directory whose config.json names
-#     the CSF reader (quant_method nvfp4_csf, format_version 1, absolute
-#     checkpoint_root, the original config under source_quantization_config).
-#     This launcher builds that directory on the host (python3), exactly as
-#     blackwell-llm-docker runtime/launcher.py prepare_csf_checkpoint() does,
-#     mounts it read-only, and points checkpoint_root at the weights mount.
-#     --quantization nvfp4_csf --load-format nvfp4_csf are fixed: the CSF
-#     reader owns the routed experts, so no other loader applies.
+#   * Both FP4-CSF checkpoint layouts, detected from MODEL_HOST_PATH:
+#     - container (lil-nvfp4-csf-checkpoint/1, HF revisions up to fd660d51):
+#       Hugging Face files under metadata/, compressed tensors under tensors/.
+#       vLLM cannot open it directly, so the launcher writes a serving
+#       directory whose config.json names the CSF reader (quant_method
+#       nvfp4_csf, format_version 1, absolute checkpoint_root, the original
+#       config under source_quantization_config), exactly as
+#       blackwell-llm-docker runtime/launcher.py prepare_csf_checkpoint().
+#     - hf (Hugging Face layout, HF main from dec48abd): config.json recipes
+#       mark the CSF expert scales; vLLM >= 5009fa56 (#1002) reads the
+#       directory as is (runtime/launcher.py prepare_hf_layout_csf()).
+#     On a recipe-CSF image only the hf layout is served (see the checkpoint
+#     section). The load flags follow the image: --quantization nvfp4_csf
+#     --load-format nvfp4_csf (nvfp4_csf image) or --quantization
+#     modelopt_mixed --load-format LOAD_FORMAT (recipe CSF).
+#     CHECKPOINT_REVISION optionally pins the hf download commit.
+#   * LOAD_FORMAT (env section 7; default b12x): vLLM's native b12x loader
+#     (O_DIRECT reads through io_uring; no VLLM_PLUGINS entry) with the
+#     io_uring seccomp block shared by every *_pair-serve.sh; instanttensor
+#     (+ its INSTANTTENSOR_* staging bounds), fastsafetensors, safetensors
+#     and auto are the fallbacks.
 #   * Expert precision as three named choices (EXPERT_ACTIVATIONS,
 #     ROUTER_WEIGHTS, PREFILL_ACTIVATIONS) mapped to the b12x/vLLM variables
 #     the same way the release launcher maps them. The env file must not set
@@ -29,13 +51,13 @@
 #     checks, as in the Qwen launcher.
 #   * CUDAGRAPH_CAPTURE_SIZES / MAX_CUDAGRAPH_CAPTURE_SIZE auto: capture
 #     exactly the decode shapes MTP/DFlash produce.
-#   * External prefix cache (env section 8, PREFIX_CACHE=none|sparkcache|
+#   * External prefix cache (env section 9, PREFIX_CACHE=none|sparkcache|
 #     lmcache), ported from the glm-5.3-flash-cache launcher: builds
 #     --kv-transfer-config, mounts PREFIX_CACHE_HOST_PATH at /prefix-cache,
 #     and for lmcache starts a CPU-only sidecar (<name>-lmcache) before vLLM
 #     and waits for its health check. Differences from the cache launcher:
 #     the cache identity defaults to the CSF checkpoint identity (manifest
-#     digest), the namespace includes DCP_SIZE, and REPLAYSSM is forced to 0
+#     or HF content digest), the namespace includes DCP_SIZE, and REPLAYSSM is forced to 0
 #     (1 is refused) whenever a connector is on. Default none = Z1F.
 #
 # Usage:
@@ -58,7 +80,7 @@ usage() {
   cat >&2 <<'EOF'
 usage: glm-53-flash-csf_pair-serve.sh [MODE] ENV_FILE [extra vllm args...]
 
-  --check     validate the env file, build the CSF serving dir, print the launch command (default)
+  --check     validate the env file and checkpoint (+ CSF serving dir for the container layout), print the launch command (default)
   --run       validate, then start the container detached
   --restart   stop and remove this rank's container, then run
   --down      stop and remove this rank's container
@@ -145,12 +167,24 @@ fi
 # them with -e. A raw copy in the env file would reach the container through
 # --env-file and make the file lie about what ran.
 for raw in VLLM_B12X_MOE_FP4_FORCE_A16 B12X_W4A16_FP32_TOPK_WEIGHTS \
-           B12X_W4A16_A4_PREFILL_MIN_TOKENS VLLM_B12X_NVFP4_ACTIVATION_MODE \
-           VLLM_B12X_MLA_CKV_GATHER; do
+           B12X_W4A16_A4_PREFILL_MIN_TOKENS B12X_W4A16_A4_PREFILL \
+           VLLM_B12X_NVFP4_ACTIVATION_MODE VLLM_B12X_MLA_CKV_GATHER; do
   if grep -Eq "^[[:space:]]*${raw}=" "$env_file"; then
     die "$raw is derived by the launcher; remove it from $env_file (set EXPERT_ACTIVATIONS / ROUTER_WEIGHTS / PREFILL_ACTIVATIONS / DCP_SIZE instead)"
   fi
 done
+
+# Renamed: the identity now pins either checkpoint layout. A container-layout
+# value is computed exactly as before and carries over unchanged.
+if grep -Eq '^[[:space:]]*CHECKPOINT_MANIFEST_SHA256=' "$env_file"; then
+  die "CHECKPOINT_MANIFEST_SHA256 was renamed CHECKPOINT_IDENTITY_SHA256 (it pins either checkpoint layout; a container-layout value carries over unchanged): rename it in $env_file"
+fi
+
+# Renamed 2026-10-08: one load-format variable for every image generation,
+# as in the other launchers (the b12x loader and its seccomp block key on it).
+if grep -Eq '^[[:space:]]*CSF_LOAD_FORMAT=' "$env_file"; then
+  die "CSF_LOAD_FORMAT was renamed LOAD_FORMAT (env section 7; default b12x, fallback instanttensor): rename it in $env_file"
+fi
 
 # shellcheck disable=SC1090
 . "$env_file"
@@ -246,9 +280,11 @@ case "$mode" in
     require_runtime
     # Markers that prove the intended path was taken. Absence of one you
     # expect means a fallback: e.g. no CSF line = not the CSF reader, no A4
-    # line with PREFILL_ACTIVATIONS=a4 = A4 prefill not compiled.
+    # line with PREFILL_ACTIVATIONS=a4 = A4 prefill not compiled. Recipe-CSF
+    # images log modelopt_mixed and the LOAD_FORMAT loader (b12x: "Loading
+    # weights took" / "Model loading took" from B12xModelLoader).
     "$CONTAINER_RUNTIME" logs "$mgmt_container" 2>&1 | grep -E \
-      'speculative_config|nvfp4_csf|NVFP4-CSF|CSF|A4 prefill|prefill with A4|W4A16|Using .* all-reduce backends|RoCEnante|B12X_ROCENANTE|kda_prefill|KDA prefill|FlashAttention version 2|split GLM-5.3 cache pages|physical page sizes|attention block size|decode_context_parallel|Available KV cache memory|GPU KV cache size|Maximum concurrency|Model loading took|Graph capturing finished|cudagraph_mode=|fastokens|Application startup complete' \
+      'speculative_config|nvfp4_csf|NVFP4-CSF|CSF|modelopt_mixed|[Ii]nstant[Tt]ensor|[Bb]12x ?[Ll]oader|io_uring|Loading weights took|A4 prefill|prefill with A4|hybrid|W4A16|Using .* all-reduce backends|RoCEnante|B12X_ROCENANTE|kda_prefill|KDA prefill|FlashAttention version 2|split GLM-5.3 cache pages|physical page sizes|attention block size|decode_context_parallel|Available KV cache memory|GPU KV cache size|Maximum concurrency|Model loading took|Graph capturing finished|cudagraph_mode=|fastokens|Application startup complete' \
       | sed 's/^/  /'
     if [ "${NODE_RANK:-}" = 0 ]; then
       printf 'health: '; curl -fsS "http://127.0.0.1:${API_PORT:-8000}/health" 2>/dev/null && echo " OK" || echo " not ready"
@@ -386,14 +422,24 @@ require_unit_fraction() {
 : "${CUDAGRAPH_MODE:=FULL_AND_PIECEWISE}"
 : "${ENABLE_PREFIX_CACHING:=1}"
 : "${ENABLE_CHUNKED_PREFILL:=1}"
-: "${SERVING_IMAGE:=local/vllm:karmic-kraken-integration-cache-cu132}"
+: "${SERVING_IMAGE:=local/vllm:karmic-kraken-intcache1008-cu132}"
 : "${SHM_SIZE:=16g}"
 : "${FABRIC_PROFILE:=single}"
 : "${B12X_ROCE_HCA:=}"
 : "${VLLM_USE_FASTOKENS:=0}"
-: "${CHECKPOINT_MANIFEST_SHA256:=}"
+: "${CHECKPOINT_IDENTITY_SHA256:=}"
+: "${CHECKPOINT_REVISION:=}"            # empty = unchecked; 7-40 hex = hf download commit prefix
+: "${LOAD_FORMAT:=b12x}"                 # recipe-CSF images: b12x | instanttensor | fastsafetensors | safetensors | auto
+# InstantTensor staging bounds (LOAD_FORMAT=instanttensor only; from the
+# glm-5.3-flash-cache launcher). BUFFER_SIZE 1.25 GiB covers the largest
+# tensor (the 1,268,776,960 B BF16 vocab head).
+: "${INSTANTTENSOR_BUFFER_SIZE:=1342177280}"
+: "${INSTANTTENSOR_IO_DEPTH:=3}"
+: "${INSTANTTENSOR_CONCURRENCY:=1}"
+: "${INSTANTTENSOR_CHUNK_SIZE:=8388608}"
+: "${INSTANTTENSOR_COPY:=auto}"
 : "${MEM_PREFLIGHT:=die}"
-: "${PREFIX_CACHE:=none}"                # none | sparkcache | lmcache (env section 8)
+: "${PREFIX_CACHE:=none}"                # none | sparkcache | lmcache (env section 9)
 : "${PREFIX_CACHE_HOST_PATH:=}"
 : "${PREFIX_CACHE_DISK_GB:=200}"
 : "${PREFIX_CACHE_MODEL_IDENTITY:=auto}"
@@ -486,9 +532,16 @@ require_bool VLLM_USE_FASTOKENS
 #     weights, BF16 activations); fp4 -> 0 (W4A4).
 #   ROUTER_WEIGHTS fp32 -> B12X_W4A16_FP32_TOPK_WEIGHTS=1: W4A16 expert
 #     outputs combined with FP32 router weights (bf16 experts only).
-#   PREFILL_ACTIVATIONS a4 -> B12X_W4A16_A4_PREFILL_MIN_TOKENS=1536: prefill
-#     rows of W4A16 MoE calls run with NVFP4 activations over the same packed
-#     weights; decode rows always stay W4A16. a16 -> 0.
+#   PREFILL_ACTIVATIONS a4: prefill rows of W4A16 MoE calls run with NVFP4
+#     activations over the same packed weights; decode rows always stay
+#     W4A16. The switch depends on the image (probed below):
+#       hybrid (recipe CSF)    B12X_W4A16_A4_PREFILL=1: EVERY prefill row,
+#                              short and chunked prefills included; decode,
+#                              verification, graph replay and draft stay A16.
+#                              A4_PREFILL_MIN_TOKENS is not read.
+#       threshold (nvfp4_csf)  B12X_W4A16_A4_PREFILL_MIN_TOKENS=A4_PREFILL_MIN_TOKENS:
+#                              only calls of at least that many tokens.
+#     a16 -> 0 on both.
 # The checkpoint card asks for FORCE_A16=1 + FP32 top-k weights; the release
 # measured a4 "as accurate as a16" on this QAD checkpoint and 12-14% faster
 # prefill at TP4 (and refuses a4 only for the pre-QAD -Spark checkpoint).
@@ -505,16 +558,15 @@ if [ "$EXPERT_ACTIVATIONS" = fp4 ]; then
 fi
 moe_force_a16=0; [ "$EXPERT_ACTIVATIONS" = bf16 ] && moe_force_a16=1
 fp32_topk=0; [ "$ROUTER_WEIGHTS" = fp32 ] && fp32_topk=1
-a4_min_tokens=0; [ "$PREFILL_ACTIVATIONS" = a4 ] && a4_min_tokens=$A4_PREFILL_MIN_TOKENS
 precision_env_args=(
   -e "VLLM_B12X_MOE_FP4_FORCE_A16=$moe_force_a16"
   -e "B12X_W4A16_FP32_TOPK_WEIGHTS=$fp32_topk"
-  -e "B12X_W4A16_A4_PREFILL_MIN_TOKENS=$a4_min_tokens"
 )
 # Release launcher: GLM without a speculator quantizes the NVFP4 activations
 # of the dense path ("GLM non-speculative activation policy").
 [ "$SPECULATOR" != none ] || precision_env_args+=(-e VLLM_B12X_NVFP4_ACTIVATION_MODE=quantized)
-precision_desc="experts $EXPERT_ACTIVATIONS, router $ROUTER_WEIGHTS, prefill $PREFILL_ACTIVATIONS$([ "$a4_min_tokens" = 0 ] || printf ' (>= %s tokens)' "$a4_min_tokens")"
+# The A4 prefill switch is appended once the image is probed (image
+# capabilities section).
 
 # ------------------------------------------------- decode context parallel
 # DCP=2 stores each request's MLA KV split across the two ranks (twice the
@@ -578,117 +630,410 @@ if [ "$SPECULATOR" = dflash2 ]; then
     || warn "DFlash2 is trained for 7 draft tokens (8-token block); NUM_SPECULATIVE_TOKENS=$NUM_SPECULATIVE_TOKENS is off the trained configuration"
 fi
 
-# ------------------------------------------- FP4-CSF checkpoint + serving dir
-# Validates the download (manifest schema, every listed shard at its exact
-# size, metadata files against their manifest sha256), then writes the
-# serving directory vLLM opens. The manifest names every shard and metadata
-# file by size/sha256, so its digest identifies the checkpoint content on
-# both nodes: compare the printed identity between ranks (or pin it with
-# CHECKPOINT_MANIFEST_SHA256 in both env files).
+# --------------------------------------------------- image capabilities
+# Probed before the checkpoint is prepared: the image decides how CSF is read
+# and how A4 prefill is switched. Source probe, not imports: the loader
+# registries pull in modules that need a GPU driver at import time.
+#   reader   nvfp4_csf  dedicated loader (Z1F's f1c2508f image, vLLM <= 64b96f45)
+#            recipes    no dedicated loader; ModelOpt recipes declare the CSF
+#                       expert scales (vLLM >= 259c4228: this profile's 19f2c20e)
+#   b12x     flashinfer (flashinfer/experimental/b12x) | standalone
+#   a4 mode  hybrid (B12X_W4A16_A4_PREFILL) | threshold (..._MIN_TOKENS)
+#   hf       reads the Hugging Face CSF layout (recipes, or vLLM #1002)
+#   ds       NVFP4 MTP draft head accepted on all of SM12x (vLLM #995)
+#   bl       native --load-format b12x: vLLM's B12xModelLoader (d0f0cad9,
+#            registered on first use, no plugin) + b12x.loader's C sources
+#            (FlashInfer package data; built at first load against liburing)
+# Without the image (absent locally, or SKIP_IMAGE_CHECKS=1) the launcher
+# assumes the recipe-CSF image it defaults to, and says so.
+image_probed=0
+if [ "${SKIP_IMAGE_CHECKS:-0}" != 1 ] \
+   && command -v "$CONTAINER_RUNTIME" >/dev/null 2>&1 \
+   && "$CONTAINER_RUNTIME" image inspect "$SERVING_IMAGE" >/dev/null 2>&1; then
+  csf_probe=$("$CONTAINER_RUNTIME" run --rm -i --entrypoint /opt/venv/bin/python "$SERVING_IMAGE" - <<'PY' 2>/dev/null || true
+import importlib.metadata as md, importlib.util, pathlib
+vroot = pathlib.Path(importlib.util.find_spec("vllm").origin).parent
+def vsrc(rel):
+    path = vroot / rel
+    return path.read_text(errors="ignore") if path.is_file() else ""
+loaders = vsrc("model_executor/model_loader/__init__.py")
+quant = vsrc("model_executor/layers/quantization/__init__.py")
+modelopt = vsrc("model_executor/layers/quantization/modelopt.py")
+if '"nvfp4_csf"' in quant and '"nvfp4_csf": Nvfp4CsfModelLoader' in loaders:
+    reader = "nvfp4_csf"
+elif '"nvfp4_csf"' not in loaders and "weight_scale_encoding" in modelopt:
+    reader = "recipes"
+else:
+    reader = "none"
+fi = importlib.util.find_spec("flashinfer")
+root = pathlib.Path(fi.origin).parent / "experimental" / "b12x" if fi and fi.origin else None
+if root is not None and root.is_dir():
+    where = "flashinfer"
+else:
+    root, where = pathlib.Path(importlib.util.find_spec("b12x").origin).parent, "standalone"
+b12x_src = "".join(f.read_text(errors="ignore") for f in (root / "moe").rglob("*.py"))
+b = all(f"class {n}" in b12x_src for n in ("Nvfp4CsfWeights", "CsfScalePlanes"))
+a4 = (root / "moe" / "_shared" / "kernels" / "w4a16" / "prefill_a4.py").is_file()
+hf = reader == "recipes" or "def is_csf_modelopt_config" in vsrc("model_executor/model_loader/nvfp4_csf_loader.py")
+ds = "if major != 12" in vsrc("models/glm5next/nvidia/mtp_draft_head.py")
+a4_mode = "hybrid" if '"B12X_W4A16_A4_PREFILL"' in vsrc("utils/b12x.py") else "threshold"
+bl = ('load_format == "b12x"' in loaders and "B12xModelLoader" in loaders
+      and bool(vsrc("model_executor/model_loader/b12x_loader.py"))
+      and (root / "loader" / "_bounce.c").is_file())
+print("CSF", reader, int(b), int(a4), md.version("nvidia-cutlass-dsl"), int(hf), int(ds), a4_mode, where, int(bl))
+PY
+)
+  case "$csf_probe" in
+    "CSF nvfp4_csf 1 "*|"CSF recipes 1 "*) : ;;
+    "CSF "*) die "$SERVING_IMAGE cannot serve NVFP4-CSF (reader / b12x CSF weights: ${csf_probe#CSF }). Build dgx-spark-builder/build-kk-integration-cache-cu132.env" ;;
+    *) die "image capability probe failed to run in $SERVING_IMAGE (output: ${csf_probe:-none}); SKIP_IMAGE_CHECKS=1 to bypass" ;;
+  esac
+  read -r _ csf_reader _ csf_a4 csf_dsl csf_hf csf_ds csf_a4_mode csf_b12x_where csf_b12x_loader <<< "$csf_probe"
+  image_probed=1
+else
+  csf_reader=recipes; csf_a4=1; csf_dsl=unprobed; csf_hf=1; csf_ds=1; csf_a4_mode=hybrid; csf_b12x_where=unprobed; csf_b12x_loader=1
+  warn "$SERVING_IMAGE not probed (absent locally or SKIP_IMAGE_CHECKS=1): assuming a recipe-CSF image (ModelOpt-recipe CSF reader, native b12x loader, hybrid A4 prefill); an nvfp4_csf-loader image is only recognized by the probe"
+fi
+case "$LOAD_FORMAT" in
+  b12x|instanttensor|fastsafetensors|safetensors|auto) : ;;
+  *) die "LOAD_FORMAT must be b12x, instanttensor, fastsafetensors, safetensors, or auto: $LOAD_FORMAT" ;;
+esac
+case "$INSTANTTENSOR_COPY" in
+  auto) : ;;
+  *) die "INSTANTTENSOR_COPY=$INSTANTTENSOR_COPY: the instanttensor_copy loader option was removed in vLLM 6575b5ac (2026-09-05); leave it auto" ;;
+esac
+if [ "$csf_reader" = recipes ]; then
+  csf_quantization=modelopt_mixed; csf_load_format=$LOAD_FORMAT
+  [ "$LOAD_FORMAT" != b12x ] || [ "${csf_b12x_loader:-0}" = 1 ] \
+    || die "LOAD_FORMAT=b12x but $SERVING_IMAGE has no native b12x load format (vLLM B12xModelLoader, d0f0cad9) or its b12x ships no loader sources (b12x/loader/_bounce.c). Set LOAD_FORMAT=instanttensor (and uncomment its block in env section 7), or rebuild"
+  case ",${VLLM_PLUGINS-}," in
+    *,b12x_loader,*) warn "VLLM_PLUGINS names b12x_loader: this vLLM has the b12x loader built in and FlashInfer's b12x registers no plugin entry point, so the entry does nothing. Set VLLM_PLUGINS= (empty)" ;;
+  esac
+else
+  csf_quantization=nvfp4_csf; csf_load_format=nvfp4_csf
+  warn "LOAD_FORMAT=$LOAD_FORMAT is not read on an nvfp4_csf-loader image: the dedicated loader reads with InstantTensor (library defaults, as Z1F ran). Serving --load-format nvfp4_csf"
+  # The effective loader: the io_uring seccomp block and the InstantTensor
+  # bounds below key on LOAD_FORMAT and stay inert.
+  LOAD_FORMAT=nvfp4_csf
+fi
+[ "$PREFILL_ACTIVATIONS" != a4 ] || [ "$csf_a4" = 1 ] \
+  || die "PREFILL_ACTIVATIONS=a4 but the image's b12x has no W4A16 A4 prefill kernels; set PREFILL_ACTIVATIONS=a16 or rebuild"
+if [ "$csf_a4_mode" = hybrid ]; then
+  a4_switch=0; [ "$PREFILL_ACTIVATIONS" = a4 ] && a4_switch=1
+  precision_env_args+=(-e "B12X_W4A16_A4_PREFILL=$a4_switch")
+  precision_desc="experts $EXPERT_ACTIVATIONS, router $ROUTER_WEIGHTS, prefill $PREFILL_ACTIVATIONS$([ "$a4_switch" = 0 ] || printf ' (hybrid: every prefill row)')"
+  [ "$PREFILL_ACTIVATIONS" != a4 ] || [ "$A4_PREFILL_MIN_TOKENS" = 1536 ] \
+    || warn "A4_PREFILL_MIN_TOKENS=$A4_PREFILL_MIN_TOKENS is ignored on this image: hybrid A4 prefill runs every prefill row with NVFP4 activations"
+else
+  a4_min_tokens=0; [ "$PREFILL_ACTIVATIONS" = a4 ] && a4_min_tokens=$A4_PREFILL_MIN_TOKENS
+  precision_env_args+=(-e "B12X_W4A16_A4_PREFILL_MIN_TOKENS=$a4_min_tokens")
+  precision_desc="experts $EXPERT_ACTIVATIONS, router $ROUTER_WEIGHTS, prefill $PREFILL_ACTIVATIONS$([ "$a4_min_tokens" = 0 ] || printf ' (>= %s tokens)' "$a4_min_tokens")"
+fi
+
+# ------------------------------------------- FP4-CSF checkpoint (two layouts)
+# MODEL_HOST_PATH holds one of the two layouts LIL publishes this checkpoint in.
+#   container  lil-nvfp4-csf-checkpoint/1 (HF revisions up to fd660d51):
+#              manifest.json + build-contract.json + metadata/ + tensors/.
+#              Validated against the manifest (schema, family, every shard at
+#              its exact size, metadata files by sha256), then a serving
+#              directory is written under <cache>/csf-serving/. Identity =
+#              sha256("lil-fp4-csf-v1\0" + manifest.json).
+#   hf         Hugging Face layout (HF main from dec48abd, 2026-10-07):
+#              config.json (ModelOpt recipes with weight_scale_encoding: csf)
+#              + model.safetensors.index.json + the indexed shards. vLLM reads
+#              the directory itself; no serving directory. Validated: config
+#              recipes, Glm5Next architecture, CSF streams in the index, every
+#              indexed shard present and non-empty. Identity = LIL's
+#              csf_hf_content_digest (runtime/launcher.py): config.json, the
+#              index, and per shard its LFS SHA-256 -- read from the hf
+#              download metadata (<root>/.cache/huggingface/download/) or the
+#              Hub-cache blob name, never by hashing the ~178 GB of shards; a
+#              shard with neither counts by size (and can then not match LIL's
+#              pinned digest). The revision comes from the same metadata.
+#              Shards must resolve inside MODEL_HOST_PATH (a Hub-cache
+#              snapshot links into ../../blobs, which the mount cannot see):
+#              download with --local-dir.
+# Compare the printed identity between ranks, or pin it with
+# CHECKPOINT_IDENTITY_SHA256 in both env files.
 command -v python3 >/dev/null 2>&1 \
-  || die "python3 is required on the host to validate the CSF checkpoint and write its serving directory"
+  || die "python3 is required on the host to validate the CSF checkpoint (and write the container layout's serving directory)"
 model_container_path=/models/glm-5.3-flash-csf
 serving_container_path=/models/glm-5.3-flash-csf-serving
 csf_serving_parent="$CACHE_HOST_PATH/csf-serving"
-mkdir -p "$csf_serving_parent" || die "cannot create $csf_serving_parent"
 csf_out=$(python3 - "$MODEL_HOST_PATH" "$model_container_path" "$csf_serving_parent" <<'PYEOF'
 import hashlib, json, os, pathlib, re, shutil, sys, tempfile
 
 root = pathlib.Path(sys.argv[1])
 container_root = sys.argv[2]
 parent = pathlib.Path(sys.argv[3])
+HEX64 = re.compile(r"[0-9a-f]{64}")
+CSF_STREAMS = (".nvfp4_csf_fixed", ".nvfp4_csf_exceptions")
+# blackwell-llm-docker runtime/checkpoints.yaml "contents" (docker-140):
+# Hugging Face-layout revision -> content identity.
+LIL_HF_CONTENTS = {
+    "dec48abd33efa73c3bb7c95b74eee10cad34f9be":
+        "bc453166d2d32020847a51d8aedab725bf96c9e6e25635181c8a0ca49530ec0e",
+}
 
 def fail(msg):
     print("ERROR " + msg)
     sys.exit(0)
 
-manifest_path = root / "manifest.json"
-if not manifest_path.is_file():
-    fail(f"{root} has no manifest.json -- not an FP4-CSF download (expected the "
-         "GLM-5.3-Flash-NVFP4-MXFP8-CSF-QAD repository root with metadata/ and tensors/)")
-raw = manifest_path.read_bytes()
-try:
-    manifest = json.loads(raw)
-except ValueError as error:
-    fail(f"manifest.json is not JSON: {error}")
-schema = manifest.get("schema")
-if schema != "lil-nvfp4-csf-checkpoint/1":
-    fail(f"manifest schema {schema!r}; this launcher serves lil-nvfp4-csf-checkpoint/1")
-if manifest.get("family") != "glm53_nvfp4":
-    fail(f"manifest family {manifest.get('family')!r}; expected glm53_nvfp4 (GLM-5.3-Flash)")
+def quant_config(config, where):
+    holder = config if "quantization_config" in config else config.get("text_config")
+    if not isinstance(holder, dict) or not isinstance(holder.get("quantization_config"), dict):
+        fail(f"{where} has no quantization_config")
+    return holder
 
-missing = []
-if not (root / "build-contract.json").is_file():
-    missing.append("build-contract.json")
-for name, digest in sorted(manifest.get("metadata_sha256", {}).items()):
-    path = root / "metadata" / name
-    if not path.is_file():
-        missing.append(f"metadata/{name}")
-    elif hashlib.sha256(path.read_bytes()).hexdigest() != digest:
-        missing.append(f"metadata/{name} (sha256 mismatch)")
-shards = manifest.get("shards", [])
-if not shards:
-    fail("manifest lists no shards")
-for shard in shards:
-    path = root / "tensors" / shard["file"]
-    size = shard.get("target_file_bytes")
-    if not path.is_file():
-        missing.append(f"tensors/{shard['file']}")
-    elif size is not None and path.stat().st_size != size:
-        missing.append(f"tensors/{shard['file']} ({path.stat().st_size} of {size} bytes)")
-if missing:
-    more = f" and {len(missing) - 6} more" if len(missing) > 6 else ""
-    fail("incomplete or modified download (missing, partial, or sha256 mismatch): " + ", ".join(missing[:6]) + more)
+def recipes(quant):
+    layers = quant.get("quantized_layers")
+    if layers is None:
+        layers = (quant.get("quantization") or {}).get("quantized_layers")
+    return layers if isinstance(layers, dict) else {}
 
-config = json.loads((root / "metadata" / "config.json").read_text())
-holder = config if "quantization_config" in config else config.get("text_config")
-if not isinstance(holder, dict) or not isinstance(holder.get("quantization_config"), dict):
-    fail("metadata/config.json has no quantization_config")
-source = holder["quantization_config"]
-if source.get("quant_method") == "nvfp4_csf":
-    fail("metadata/config.json is already a serving config; point MODEL_HOST_PATH at the original download")
-holder["quantization_config"] = {
-    "quant_method": "nvfp4_csf",
-    "format_version": 1,
-    "checkpoint_root": container_root,
-    "source_quantization_config": source,
-}
-arch = config.get("architectures") or []
-if not any(a.startswith("Glm5Next") for a in arch):
-    fail(f"architectures {arch}; expected Glm5Next* (GLM-5.3-Flash)")
+def check_arch(config, where):
+    arch = config.get("architectures") or []
+    if not any(a.startswith("Glm5Next") for a in arch):
+        fail(f"{where} architectures {arch}; expected Glm5Next* (GLM-5.3-Flash)")
 
-identity = hashlib.sha256(b"lil-fp4-csf-v1\0" + raw).hexdigest()
-name = re.sub(r"[^A-Za-z0-9._-]", "-", root.name) or "checkpoint"
-serving = parent / f"{name}-{identity[:12]}"
-tmp = pathlib.Path(tempfile.mkdtemp(prefix=".serving-", dir=parent))
-for item in sorted((root / "metadata").iterdir()):
-    if item.is_file() and item.name != "config.json":
-        shutil.copyfile(item, tmp / item.name)
-(tmp / "config.json").write_text(json.dumps(config, indent=2) + "\n")
-os.chmod(tmp, 0o755)
+def vision_stored(quant):
+    # vLLM >= 64b96f45 applies stored model.visual.* recipes before
+    # VLLM_GLM53_VISION_MXFP8 (glm5next/nvidia/model.py _vision_quant_config).
+    return int(any(n.startswith(("model.visual.", "visual.")) for n in recipes(quant)))
 
-def snapshot(d):
-    return {f.name: f.read_bytes() for f in sorted(d.iterdir()) if f.is_file()}
+def container_layout():
+    manifest_path = root / "manifest.json"
+    raw = manifest_path.read_bytes()
+    try:
+        manifest = json.loads(raw)
+    except ValueError as error:
+        fail(f"manifest.json is not JSON: {error}")
+    schema = manifest.get("schema")
+    if schema != "lil-nvfp4-csf-checkpoint/1":
+        fail(f"manifest schema {schema!r}; this launcher serves lil-nvfp4-csf-checkpoint/1")
+    if manifest.get("family") != "glm53_nvfp4":
+        fail(f"manifest family {manifest.get('family')!r}; expected glm53_nvfp4 (GLM-5.3-Flash)")
 
-if serving.is_dir() and snapshot(serving) == snapshot(tmp):
-    # Unchanged: keep the directory a running container may have mounted.
-    shutil.rmtree(tmp)
+    missing = []
+    if not (root / "build-contract.json").is_file():
+        missing.append("build-contract.json")
+    for name, digest in sorted(manifest.get("metadata_sha256", {}).items()):
+        path = root / "metadata" / name
+        if not path.is_file():
+            missing.append(f"metadata/{name}")
+        elif hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+            missing.append(f"metadata/{name} (sha256 mismatch)")
+    shards = manifest.get("shards", [])
+    if not shards:
+        fail("manifest lists no shards")
+    for shard in shards:
+        path = root / "tensors" / shard["file"]
+        size = shard.get("target_file_bytes")
+        if not path.is_file():
+            missing.append(f"tensors/{shard['file']}")
+        elif size is not None and path.stat().st_size != size:
+            missing.append(f"tensors/{shard['file']} ({path.stat().st_size} of {size} bytes)")
+    if missing:
+        more = f" and {len(missing) - 6} more" if len(missing) > 6 else ""
+        fail("incomplete or modified download (missing, partial, or sha256 mismatch): " + ", ".join(missing[:6]) + more)
+
+    config = json.loads((root / "metadata" / "config.json").read_text())
+    holder = quant_config(config, "metadata/config.json")
+    source = holder["quantization_config"]
+    if source.get("quant_method") == "nvfp4_csf":
+        fail("metadata/config.json is already a serving config; point MODEL_HOST_PATH at the original download")
+    holder["quantization_config"] = {
+        "quant_method": "nvfp4_csf",
+        "format_version": 1,
+        "checkpoint_root": container_root,
+        "source_quantization_config": source,
+    }
+    check_arch(config, "metadata/config.json")
+
+    identity = hashlib.sha256(b"lil-fp4-csf-v1\0" + raw).hexdigest()
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        fail(f"cannot create {parent}: {error}")
+    name = re.sub(r"[^A-Za-z0-9._-]", "-", root.name) or "checkpoint"
+    serving = parent / f"{name}-{identity[:12]}"
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix=".serving-", dir=parent))
+    for item in sorted((root / "metadata").iterdir()):
+        if item.is_file() and item.name != "config.json":
+            shutil.copyfile(item, tmp / item.name)
+    (tmp / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+    os.chmod(tmp, 0o755)
+
+    def snapshot(d):
+        return {f.name: f.read_bytes() for f in sorted(d.iterdir()) if f.is_file()}
+
+    if serving.is_dir() and snapshot(serving) == snapshot(tmp):
+        # Unchanged: keep the directory a running container may have mounted.
+        shutil.rmtree(tmp)
+    else:
+        if serving.exists():
+            shutil.rmtree(serving)
+        tmp.rename(serving)
+    total = sum(s.get("target_file_bytes") or 0 for s in shards)
+    # The revision hf download --local-dir recorded for manifest.json (the
+    # file every container download has); "-" when it was copied without
+    # its .cache/huggingface/download/ metadata.
+    revision, _ = hf_metadata("manifest.json")
+    # layout identity serving shards bytes revision lil vision by_size
+    print(f"OK container {identity} {serving} {len(shards)} {total} {revision or '-'} - {vision_stored(source)} 0")
+
+def hf_metadata(name):
+    """(commit, etag) that hf download --local-dir recorded for a file."""
+    meta = root / ".cache" / "huggingface" / "download" / f"{name}.metadata"
+    try:
+        lines = meta.read_text().splitlines()
+    except OSError:
+        return None, None
+    commit = lines[0].strip() if lines else None
+    etag = lines[1].strip().strip('"') if len(lines) > 1 else None
+    return commit or None, etag or None
+
+def hf_layout():
+    config_path = root / "config.json"
+    index_path = root / "model.safetensors.index.json"
+    try:
+        config_raw = config_path.read_bytes()
+        index_raw = index_path.read_bytes()
+        config = json.loads(config_raw)
+        index = json.loads(index_raw)
+    except ValueError as error:
+        fail(f"config.json or model.safetensors.index.json is not JSON: {error}")
+    check_arch(config, "config.json")
+    quant = quant_config(config, "config.json")["quantization_config"]
+    if quant.get("quant_method") == "nvfp4_csf":
+        fail("config.json is a serving config (quant_method nvfp4_csf), not a download; point MODEL_HOST_PATH at the hf download root")
+    if not any(isinstance(r, dict) and r.get("weight_scale_encoding") == "csf"
+               for r in recipes(quant).values()):
+        fail("config.json has no ModelOpt recipe with weight_scale_encoding: csf -- not an FP4-CSF checkpoint")
+    weight_map = index.get("weight_map")
+    if not isinstance(weight_map, dict) or not weight_map:
+        fail("model.safetensors.index.json has no weight_map")
+    if not any(name.endswith(CSF_STREAMS) for name in weight_map):
+        fail("model.safetensors.index.json names no .nvfp4_csf_fixed/.nvfp4_csf_exceptions streams -- not an FP4-CSF checkpoint")
+    shards = sorted(set(weight_map.values()))
+
+    revisions = set()
+    for name in ("config.json", "model.safetensors.index.json"):
+        commit, _ = hf_metadata(name)
+        if commit:
+            revisions.add(commit)
+    # Same byte stream as runtime/launcher.py csf_hf_content_digest(); a
+    # local-dir download records the LFS SHA-256 as the file's etag, which is
+    # what the Hub cache names the blob, so both download modes agree.
+    digest = hashlib.sha256(b"lil-fp4-csf-hf-v1\0")
+    digest.update(config_raw + b"\0")
+    digest.update(index_raw + b"\0")
+    missing, total, by_size = [], 0, 0
+    real_root = os.path.realpath(root)
+    for name in shards:
+        rel = pathlib.PurePosixPath(name)
+        if rel.is_absolute() or ".." in rel.parts or rel.suffix != ".safetensors":
+            fail(f"the index names a shard outside the checkpoint: {name}")
+        path = root / name
+        if not path.is_file():
+            missing.append(name)
+            continue
+        target = pathlib.Path(os.path.realpath(path))
+        if os.path.commonpath([real_root, str(target)]) != real_root:
+            # A Hub-cache snapshot links into ../../blobs: the read-only
+            # mount of MODEL_HOST_PATH cannot follow it in the container.
+            fail(f"{name} resolves outside MODEL_HOST_PATH ({target}); a Hub-cache "
+                 "snapshot does not survive the container mount -- download with "
+                 "'hf download ... --local-dir <dir>' and point MODEL_HOST_PATH there")
+        size = target.stat().st_size
+        if size == 0:
+            missing.append(f"{name} (empty)")
+            continue
+        total += size
+        commit, etag = hf_metadata(name)
+        if commit:
+            revisions.add(commit)
+        if target.parent.name == "blobs" and HEX64.fullmatch(target.name):
+            content = target.name
+        elif etag and HEX64.fullmatch(etag):
+            content = etag
+        else:
+            content = str(size)
+            by_size += 1
+        digest.update(f"{name}\0{content}\0".encode())
+    if missing:
+        more = f" and {len(missing) - 6} more" if len(missing) > 6 else ""
+        fail(f"incomplete download ({len(missing)} of {len(shards)} indexed shards missing or empty): " + ", ".join(missing[:6]) + more)
+    identity = digest.hexdigest()
+    if len(revisions) == 1:
+        revision = next(iter(revisions))
+    else:
+        revision = "mixed" if revisions else "-"
+    if by_size:
+        lil = "size-based"
+    elif revision in LIL_HF_CONTENTS:
+        lil = "match" if LIL_HF_CONTENTS[revision] == identity else "mismatch"
+    else:
+        lil = "match" if identity in LIL_HF_CONTENTS.values() else "unpinned"
+    print(f"OK hf {identity} - {len(shards)} {total} {revision} {lil} {vision_stored(quant)} {by_size}")
+
+if (root / "manifest.json").is_file():
+    container_layout()
+elif (root / "config.json").is_file() and (root / "model.safetensors.index.json").is_file():
+    hf_layout()
 else:
-    if serving.exists():
-        shutil.rmtree(serving)
-    tmp.rename(serving)
-total = sum(s.get("target_file_bytes") or 0 for s in shards)
-print(f"OK {identity} {serving} {len(shards)} {total}")
+    fail(f"{root} is neither FP4-CSF layout: no manifest.json (container layout) and no "
+         "config.json + model.safetensors.index.json (Hugging Face layout). Point MODEL_HOST_PATH "
+         "at the hf download root of GLM-5.3-Flash-NVFP4-MXFP8-CSF-QAD")
 PYEOF
 ) || die "CSF checkpoint validation failed to run (python3 error above)"
 case "$csf_out" in
-  OK\ *) read -r _ csf_identity csf_serving_host csf_shards csf_bytes <<< "$csf_out" ;;
+  OK\ *) read -r _ csf_layout csf_identity csf_serving_host csf_shards csf_bytes csf_revision csf_lil csf_vision_stored csf_by_size <<< "$csf_out" ;;
   ERROR\ *) die "MODEL_HOST_PATH: ${csf_out#ERROR }" ;;
   *) die "CSF checkpoint validation produced no result: $csf_out" ;;
 esac
-if [ -n "$CHECKPOINT_MANIFEST_SHA256" ]; then
-  [ "$CHECKPOINT_MANIFEST_SHA256" = "$csf_identity" ] \
-    || die "checkpoint identity $csf_identity != CHECKPOINT_MANIFEST_SHA256 $CHECKPOINT_MANIFEST_SHA256 -- the two nodes do not hold the same checkpoint"
+case "$csf_layout" in
+  container)
+    # A recipe-CSF image has no nvfp4_csf loader. LIL's launcher rewrites a
+    # container into ModelOpt recipes for the 744B checkpoint; that rewrite
+    # keeps only the routed-expert recipes, which is not a qualified path
+    # for this checkpoint's MXFP8 attention/shared experts. LIL serves
+    # GLM-5.3-Flash from the HF layout (dec48abd), and so does this launcher.
+    [ "$csf_reader" = nvfp4_csf ] \
+      || die "MODEL_HOST_PATH is a container-layout CSF checkpoint, which only an nvfp4_csf-loader image serves (Z1F's local/vllm:karmic-kraken-integration-cache-cu132); $SERVING_IMAGE reads CSF through ModelOpt recipes. Point MODEL_HOST_PATH at the Hugging Face layout (dec48abd, see MODEL_HOST_PATH in the env file) or set SERVING_IMAGE to Z1F's image"
+    serve_path=$serving_container_path
+    ;;
+  hf)
+    serve_path=$model_container_path
+    csf_serving_host=
+    case "$csf_lil" in
+      mismatch) warn "MODEL_HOST_PATH: revision ${csf_revision:0:12} but content identity $csf_identity differs from the one blackwell-llm-docker pins for it -- config.json, the index or a shard is not the published file (edited, or re-downloaded over another revision?)" ;;
+      size-based) warn "MODEL_HOST_PATH: $csf_by_size shard(s) carry no hf download metadata (.cache/huggingface/download/), so the identity counts them by size: still valid between ranks copied the same way, but it cannot match LIL's pinned digest. Download with 'hf download --local-dir' on each node to get the full identity" ;;
+    esac
+    [ "$csf_revision" != mixed ] \
+      || warn "MODEL_HOST_PATH: the hf download metadata names more than one revision; files from two revisions may be mixed. Re-download into an empty directory"
+    ;;
+  *) die "CSF checkpoint validation returned an unknown layout: $csf_layout" ;;
+esac
+if [ -n "$CHECKPOINT_IDENTITY_SHA256" ]; then
+  printf '%s' "$CHECKPOINT_IDENTITY_SHA256" | grep -Eq '^[0-9a-f]{64}$' \
+    || die "CHECKPOINT_IDENTITY_SHA256 must be 64 lowercase hex chars (copy the identity --check prints): $CHECKPOINT_IDENTITY_SHA256"
+  [ "$CHECKPOINT_IDENTITY_SHA256" = "$csf_identity" ] \
+    || die "checkpoint identity $csf_identity != CHECKPOINT_IDENTITY_SHA256 $CHECKPOINT_IDENTITY_SHA256 -- the two nodes do not hold the same checkpoint (or MODEL_HOST_PATH moved to another revision: re-pin both files)"
+fi
+# CHECKPOINT_REVISION: the Hub commit (full or >= 7-hex prefix) MODEL_HOST_PATH
+# must have been downloaded at, read from the hf --local-dir metadata. Guards
+# against pointing a rank file at the wrong per-revision folder; the content
+# itself is pinned by CHECKPOINT_IDENTITY_SHA256.
+if [ -n "$CHECKPOINT_REVISION" ]; then
+  printf '%s' "$CHECKPOINT_REVISION" | grep -Eq '^[0-9a-f]{7,40}$' \
+    || die "CHECKPOINT_REVISION must be 7-40 lowercase hex chars (a Hub commit or its prefix): $CHECKPOINT_REVISION"
+  case "$csf_revision" in
+    -) die "CHECKPOINT_REVISION=$CHECKPOINT_REVISION but $MODEL_HOST_PATH carries no hf download metadata (.cache/huggingface/download/) to read a revision from; download with 'hf download --revision <sha> --local-dir <dir>' or leave CHECKPOINT_REVISION empty" ;;
+    mixed) die "CHECKPOINT_REVISION=$CHECKPOINT_REVISION but the hf download metadata in $MODEL_HOST_PATH names more than one revision; re-download into an empty directory" ;;
+    "$CHECKPOINT_REVISION"*) : ;;
+    *) die "MODEL_HOST_PATH was downloaded at revision ${csf_revision:0:12}, not CHECKPOINT_REVISION=$CHECKPOINT_REVISION -- wrong per-revision folder?" ;;
+  esac
 fi
 
 # ----------------------------------------------------------- sizes / graphs
@@ -797,18 +1142,42 @@ case "$LINEAR_BACKEND" in
   *) warn "LINEAR_BACKEND=$LINEAR_BACKEND: the MXFP8 attention/shared-expert projections are qualified on b12x; auto may pick FlashInfer kernels unqualified on sm_121" ;;
 esac
 
-# GB10 is capability 12.1. Two GLM-5.3 features remain gated to (12, 0):
-#   VLLM_GLM53_MTP_DRAFT_HEAD=nvfp4 raises at draft load ("requires CUDA
-#     capability 12.0; got 12.1"); the GB10 draft head is VLLM_MTP_NVFP4_LM_HEAD=1.
-#   VLLM_GLM53_L2_PREFETCH is off by default on 12.1; =1 forces it. The GLM
-#     windows (20/50/15 MB) are sized for the 128 MB L2 of an RTX PRO 6000;
-#     GB10 has 24 MB (upstream's GB10 DS4.1 prefetcher runs 20/16/20 MB with
-#     a 4-CTA grid, which this pin already selects on 12.1).
-case "${VLLM_GLM53_MTP_DRAFT_HEAD:-bf16}" in
+# Vocabulary heads (GB10 is capability 12.1). Three variables decide which
+# weight produces MTP draft logits (vLLM 64b96f45; unchanged at 19f2c20e):
+#   VLLM_MTP_NVFP4_LM_HEAD=1 (vLLM default 1): the MTP layer loads its own
+#     runtime-quantized NVFP4 head ("path A", Z1F).
+#   VLLM_MXFP8_LM_HEAD=1: the target head is quantized to MXFP8 at load; with
+#     MTP_NVFP4_LM_HEAD=0 the drafter shares it.
+#   VLLM_GLM53_MTP_DRAFT_HEAD=nvfp4 ("path B"): an NVFP4 copy of the target's
+#     BF16 head on FlashInfer's CuTe-DSL W4A16 GEMM. Accepted on all of SM12x
+#     since vLLM #995 (f1c2508f raised on 12.1). glm5next/nvidia/mtp.py
+#     prepare_draft_lm_head() skips the copy WITHOUT a log line when the head
+#     it receives is runtime-quantized, so nvfp4 only takes effect with BOTH
+#     VLLM_MTP_NVFP4_LM_HEAD=0 and VLLM_MXFP8_LM_HEAD=0 (BF16 verifier head:
+#     the MXFP8 head's measured +2-4% steps/s at C1 is given up).
+# VLLM_GLM53_L2_PREFETCH is off by default on 12.1; =1 forces it. The GLM
+#   windows (20/50/15 MB) are sized for the 128 MB L2 of an RTX PRO 6000;
+#   GB10 has 24 MB (upstream's GB10 DS4.1 prefetcher runs 20/16/20 MB with
+#   a 4-CTA grid, which this pin already selects on 12.1).
+draft_head=${VLLM_GLM53_MTP_DRAFT_HEAD:-bf16}
+case "$draft_head" in
   bf16) : ;;
-  nvfp4) die "VLLM_GLM53_MTP_DRAFT_HEAD=nvfp4 requires CUDA capability 12.0; GB10 is 12.1. Use VLLM_GLM53_MTP_DRAFT_HEAD=bf16 with VLLM_MTP_NVFP4_LM_HEAD=1" ;;
+  nvfp4)
+    [ "$SPECULATOR" = mtp ] \
+      || warn "VLLM_GLM53_MTP_DRAFT_HEAD=nvfp4 only affects SPECULATOR=mtp; it does nothing with SPECULATOR=$SPECULATOR"
+    [ "${VLLM_MTP_NVFP4_LM_HEAD:-1}" = 0 ] \
+      || die "VLLM_GLM53_MTP_DRAFT_HEAD=nvfp4 with VLLM_MTP_NVFP4_LM_HEAD=${VLLM_MTP_NVFP4_LM_HEAD:-1 (vLLM default)}: the drafter keeps its own NVFP4 head and vLLM silently skips the draft-head copy. Set VLLM_MTP_NVFP4_LM_HEAD=0 (and VLLM_MXFP8_LM_HEAD=0)"
+    [ "${VLLM_MXFP8_LM_HEAD:-0}" = 0 ] \
+      || die "VLLM_GLM53_MTP_DRAFT_HEAD=nvfp4 with VLLM_MXFP8_LM_HEAD=$VLLM_MXFP8_LM_HEAD: the drafter shares the MXFP8 target head and vLLM silently skips the draft-head copy. Set VLLM_MXFP8_LM_HEAD=0 (the verifier head becomes BF16)"
+    ;;
   *) die "VLLM_GLM53_MTP_DRAFT_HEAD must be bf16 or nvfp4: $VLLM_GLM53_MTP_DRAFT_HEAD" ;;
 esac
+# A checkpoint that stores its vision tower quantized (HF layout, dec48abd:
+# MXFP8 attention + W4A16 NVFP4 MLP) is served with those recipes; vLLM then
+# never reads VLLM_GLM53_VISION_MXFP8.
+if [ "$csf_vision_stored" = 1 ] && [ "${VLLM_GLM53_VISION_MXFP8:-0}" = 1 ]; then
+  warn "VLLM_GLM53_VISION_MXFP8=1 has no effect: this checkpoint stores its vision tower quantized and vLLM applies the stored recipes first. Set 0 so the env file says what runs"
+fi
 if [ "${VLLM_GLM53_L2_PREFETCH:-}" = 1 ]; then
   [ -n "${VLLM_GLM53_L2_PREFETCH_BUDGET_B_MB:-}" ] \
     || warn "VLLM_GLM53_L2_PREFETCH=1 with the default 50 MB window B: larger than GB10's 24 MB L2. Set VLLM_GLM53_L2_PREFETCH_BUDGET_{A,B,C,A_MLA}_MB (e.g. 20/16/15/16) for the A/B"
@@ -963,12 +1332,10 @@ if [ -d /dev/shm ]; then
   esac
 fi
 
-# Image probes (only when the image is present locally): LD_PRELOAD paths,
-# the paired NVFP4-CSF support in vLLM AND b12x, and fastokens.
-image_desc="not present locally (probes skipped)"
-if [ "${SKIP_IMAGE_CHECKS:-0}" != 1 ] \
-   && command -v "$CONTAINER_RUNTIME" >/dev/null 2>&1 \
-   && "$CONTAINER_RUNTIME" image inspect "$SERVING_IMAGE" >/dev/null 2>&1; then
+# Image checks (only when the image is present locally): LD_PRELOAD paths
+# and fastokens. CSF reader, b12x, A4 mode, HF reader and draft head were
+# probed in the image capabilities section.
+if [ "$image_probed" = 1 ]; then
   preload_missing=""
   old_ifs=$IFS; IFS=:
   for lib in $LD_PRELOAD; do
@@ -980,32 +1347,11 @@ if [ "${SKIP_IMAGE_CHECKS:-0}" != 1 ] \
   [ -z "$preload_missing" ] \
     || die "LD_PRELOAD names path(s) absent from the image:$preload_missing -- every process in the container would fail at exec"
 
-  # Source probe, not imports: the loader registries pull in modules that
-  # need a GPU driver at import time.
-  csf_probe=$("$CONTAINER_RUNTIME" run --rm -i --entrypoint /opt/venv/bin/python "$SERVING_IMAGE" - <<'PY' 2>/dev/null || true
-import importlib.metadata as md, importlib.util, pathlib
-def src(mod):
-    spec = importlib.util.find_spec(mod)
-    return pathlib.Path(spec.origin).read_text() if spec and spec.origin else ""
-q = src("vllm.model_executor.layers.quantization")
-l = src("vllm.model_executor.model_loader")
-v = '"nvfp4_csf"' in q and '"nvfp4_csf": Nvfp4CsfModelLoader' in l
-root = pathlib.Path(importlib.util.find_spec("b12x").origin).parent
-b12x_src = "".join(f.read_text(errors="ignore") for f in (root / "moe").rglob("*.py"))
-b = all(f"class {n}" in b12x_src for n in ("Nvfp4CsfWeights", "CsfScalePlanes"))
-a4 = (root / "moe" / "_shared" / "kernels" / "w4a16" / "prefill_a4.py").is_file()
-print("CSF", int(v), int(b), int(a4), md.version("nvidia-cutlass-dsl"))
-PY
-)
-  case "$csf_probe" in
-    "CSF 1 1 "*) : ;;
-    "CSF "*) die "$SERVING_IMAGE cannot serve NVFP4-CSF (vllm reader/b12x CSF weights: ${csf_probe#CSF }). Build build-kk-integration-cache-cu132.env (vLLM f1c2508f + b12x 52640cb1)" ;;
-    *) die "image capability probe failed to run in $SERVING_IMAGE (output: ${csf_probe:-none}); SKIP_IMAGE_CHECKS=1 to bypass" ;;
-  esac
-  read -r _ _ _ csf_a4 csf_dsl <<< "$csf_probe"
-  [ "$PREFILL_ACTIVATIONS" != a4 ] || [ "$csf_a4" = 1 ] \
-    || die "PREFILL_ACTIVATIONS=a4 but the image's b12x has no W4A16 A4 prefill kernels; set PREFILL_ACTIVATIONS=a16 or rebuild"
-  image_desc="NVFP4-CSF reader + b12x CSF + A4 prefill present; CuTe DSL $csf_dsl"
+  [ "$csf_layout" != hf ] || [ "${csf_hf:-0}" = 1 ] \
+    || die "MODEL_HOST_PATH is a Hugging Face-layout CSF checkpoint but $SERVING_IMAGE's vLLM has no HF-layout CSF reader (vLLM #1002, 5009fa56). Use local/vllm:karmic-kraken-intcache1008-cu132 (build-kk-integration-cache-cu132.env), or point MODEL_HOST_PATH at a container-layout revision (a1559e26 / fd660d51)"
+  [ "$draft_head" != nvfp4 ] || [ "${csf_ds:-0}" = 1 ] \
+    || die "VLLM_GLM53_MTP_DRAFT_HEAD=nvfp4 but $SERVING_IMAGE's vLLM still gates the NVFP4 draft head to capability 12.0 (GB10 is 12.1; lifted in vLLM #995). Use local/vllm:karmic-kraken-intcache1008-cu132 (build-kk-integration-cache-cu132.env) or set bf16"
+  image_desc="CSF reader $csf_reader; b12x $csf_b12x_where$([ "$csf_reader" = recipes ] && { [ "${csf_b12x_loader:-0}" = 1 ] && printf ' (native loader)' || printf ' (no native loader)'; }); A4 prefill $csf_a4_mode; HF-layout reader $([ "${csf_hf:-0}" = 1 ] && echo yes || echo no); SM12x draft head $([ "${csf_ds:-0}" = 1 ] && echo yes || echo no); CuTe DSL $csf_dsl"
 
   if [ "$VLLM_USE_FASTOKENS" = 1 ]; then
     fk_label=$("$CONTAINER_RUNTIME" image inspect --format '{{index .Config.Labels "org.local-inference.fastokens.version"}}' "$SERVING_IMAGE" 2>/dev/null || true)
@@ -1013,6 +1359,8 @@ PY
       || die "VLLM_USE_FASTOKENS=1 but $SERVING_IMAGE carries no fastokens (no org.local-inference.fastokens.version label); vLLM would stop at tokenizer load. Rebuild with PATCH_FASTOKENS=on or set 0"
     image_desc="$image_desc; fastokens $fk_label"
   fi
+else
+  image_desc="not probed (assumed recipe CSF: native b12x loader, hybrid A4)"
 fi
 
 # ----------------------------------------------------------- launch command
@@ -1031,6 +1379,20 @@ if [ -n "$CHAT_TEMPLATE_HOST_PATH" ]; then
   [ -f "$CHAT_TEMPLATE_HOST_PATH" ] || die "CHAT_TEMPLATE_HOST_PATH does not exist: $CHAT_TEMPLATE_HOST_PATH"
 fi
 
+# The INSTANTTENSOR_* staging bounds are read by the instanttensor library
+# only; under any other loader they are inert, so they are passed only when
+# that loader is selected (the env file's own copies still reach the
+# container via --env-file, which is harmless). Not on an nvfp4_csf-loader
+# image (LOAD_FORMAT=nvfp4_csf here): Z1F ran its InstantTensor defaults.
+instanttensor_env_args=()
+if [ "$LOAD_FORMAT" = instanttensor ]; then
+  instanttensor_env_args=(
+    -e INSTANTTENSOR_BUFFER_SIZE="$INSTANTTENSOR_BUFFER_SIZE"
+    -e INSTANTTENSOR_IO_DEPTH="$INSTANTTENSOR_IO_DEPTH"
+    -e INSTANTTENSOR_CONCURRENCY="$INSTANTTENSOR_CONCURRENCY"
+    -e INSTANTTENSOR_CHUNK_SIZE="$INSTANTTENSOR_CHUNK_SIZE"
+  )
+fi
 extra_args=(--prefill-schedule-interval "$PREFILL_SCHEDULE_INTERVAL")
 [ -z "$COMPILATION_LEVEL" ] || extra_args+=("-O$COMPILATION_LEVEL")
 [ -z "$KDA_PREFILL_BACKEND" ] || extra_args+=(--kda-prefill-backend "$KDA_PREFILL_BACKEND")
@@ -1082,7 +1444,7 @@ if [ "$NUM_SPECULATIVE_TOKENS" -gt 0 ]; then
   case "$SPECULATOR" in
     mtp)
       # The MTP layer is read from the target checkpoint (no "model"), so it
-      # follows the CSF serving directory and load format automatically.
+      # follows the served directory (either layout) and load format.
       adaptive_fields=
       if [ "$ADAPTIVE_SPECULATIVE_TOKENS" = 1 ]; then
         adaptive_fields=$(printf ',"adaptive_speculative_tokens_window":%s,"adaptive_speculative_tokens_initial":%s' \
@@ -1094,8 +1456,9 @@ if [ "$NUM_SPECULATIVE_TOKENS" -gt 0 ]; then
       ;;
     dflash2)
       # The DFlash2 drafter is a plain safetensors checkpoint: without
-      # draft_load_config it inherits the target's nvfp4_csf load format and
-      # fails. The release profile pins load_format auto for exactly this.
+      # draft_load_config it inherits the target's load format (nvfp4_csf,
+      # or b12x) and fails or takes the wrong path. The release profile pins
+      # load_format auto for exactly this.
       dflash_attention_json=
       [ -z "$DFLASH_ATTENTION_BACKEND" ] || dflash_attention_json=$(printf ',"attention_backend":"%s"' "$DFLASH_ATTENTION_BACKEND")
       speculative_config=$(printf \
@@ -1115,9 +1478,11 @@ esac
 
 mount_args=(
   -v "$MODEL_HOST_PATH:$model_container_path:ro"
-  -v "$csf_serving_host:$serving_container_path:ro"
   -v "$CACHE_HOST_PATH:/cache"
 )
+# Container layout only: vLLM opens the serving directory, which points the
+# CSF reader at the weights mount. The HF layout is served from the mount.
+[ -z "$csf_serving_host" ] || mount_args+=(-v "$csf_serving_host:$serving_container_path:ro")
 [ "$SPECULATOR" != dflash2 ] || mount_args+=(-v "$DFLASH_MODEL_HOST_PATH:$dflash_container_path:ro")
 [ -z "$CHAT_TEMPLATE_HOST_PATH" ] || mount_args+=(-v "$CHAT_TEMPLATE_HOST_PATH:$chat_template_container_path:ro")
 if [ -n "$TORCH_PROFILE_HOST_DIR" ]; then
@@ -1137,8 +1502,8 @@ profile_env_args=()
 # Ported from glm-5.3-flash-cache_pair-serve.sh. Builds --kv-transfer-config
 # and the extra serve flags, mounts the per-node NVMe directory, and
 # (lmcache) describes the CPU-only lmcache server container started before
-# vLLM in --run. See env section 8. CSF deltas: cache identity = the CSF
-# checkpoint identity, DCP_SIZE in the namespace, REPLAYSSM forced to 0.
+# vLLM in --run. See env section 9. CSF deltas: cache identity = the CSF
+# checkpoint identity (either layout), DCP_SIZE in the namespace, REPLAYSSM forced to 0.
 prefix_cache_desc="none (GPU prefix cache only, ${RECURRENT_CHECKPOINT_POLICY:-auto})"
 lmc_server_cmd=()
 lmc_container="${mgmt_container}-lmcache"
@@ -1167,8 +1532,11 @@ case "$PREFIX_CACHE" in
       || warn "PREFIX_CACHE=$PREFIX_CACHE with DCP_SIZE=$DCP_SIZE: no connector has been run with decode context parallelism on this pair (the release qualifies TP2 external cache at DCP1 only)"
 
     # Cache identity of the target: explicit 64-hex, or auto = the CSF
-    # checkpoint identity printed above (sha256 over manifest.json, which
-    # names every shard and metadata file by size/sha256).
+    # checkpoint identity printed above (container: sha256 over manifest.json,
+    # which names every shard and metadata file by size/sha256; hf: LIL's
+    # content digest over config.json, the index and every shard's LFS
+    # SHA-256). Another checkpoint revision is another namespace: caches
+    # written for the old one are not read.
     if [ "$PREFIX_CACHE_MODEL_IDENTITY" = auto ]; then
       pc_target=$csf_identity
     else
@@ -1338,6 +1706,66 @@ if [ "$PREFIX_CACHE" != none ] && [ -n "$KV_CACHE_MEMORY_BYTES" ]; then
 fi
 # ===== END prefix cache =====
 
+# ===== BEGIN shared block: b12x loader io_uring (identical in every *_pair-serve.sh) =====
+# LOAD_FORMAT=b12x reads weights through an O_DIRECT io_uring ring (b12x
+# 1ec67ef6). Three things must hold, and each fails differently:
+#   1. liburing in the IMAGE -- b12x builds the reader at first use and treats
+#      liburing as optional: "io_uring bounce support is unavailable".
+#      (build-spark-cu132.sh PATCH_IO_URING bakes it.)
+#   2. io_uring_setup/enter/register allowed by the CONTAINER seccomp. Docker
+#      >= 25's default profile blocks them, and an image cannot relax its own
+#      seccomp (the runtime installs the filter before the entrypoint), so the
+#      profile is passed from here: one shared copy at the deployments root.
+#   3. HOST sysctl kernel.io_uring_disabled=0.
+# SECCOMP_PROFILE (env file; usually left out):
+#   unset/empty = auto: with LOAD_FORMAT=b12x use <deployments>/seccomp-io-uring.json
+#                 (the parent of this script's folder); other loaders pass nothing
+#   <path>      = that profile (absolute, or relative to this script's folder)
+#   none        = pass nothing (the docker daemon default already allows io_uring)
+#   unconfined  = no syscall filtering at all (last resort)
+: "${SECCOMP_PROFILE:=}"
+: "${SCRIPT_DIR:=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}"
+seccomp_args=()
+seccomp_desc="runtime default"
+seccomp_path=""
+case "$SECCOMP_PROFILE" in
+  none) seccomp_desc="runtime default (SECCOMP_PROFILE=none)" ;;
+  unconfined)
+    seccomp_args=(--security-opt seccomp=unconfined); seccomp_desc=unconfined
+    warn "SECCOMP_PROFILE=unconfined disables syscall filtering for the whole container; prefer the shared seccomp-io-uring.json" ;;
+  "") [ "$LOAD_FORMAT" != b12x ] || seccomp_path="$SCRIPT_DIR/../seccomp-io-uring.json" ;;
+  /*) seccomp_path=$SECCOMP_PROFILE ;;
+  *)  seccomp_path="$SCRIPT_DIR/$SECCOMP_PROFILE" ;;
+esac
+if [ -n "$seccomp_path" ]; then
+  [ -f "$seccomp_path" ] || die "seccomp profile not found: $seccomp_path -- LOAD_FORMAT=b12x needs io_uring allowed in the container. Put the shared seccomp-io-uring.json in the deployments root ($(cd "$SCRIPT_DIR/.." && pwd)/), point SECCOMP_PROFILE at a copy, or set SECCOMP_PROFILE=none if the docker daemon default already allows io_uring"
+  seccomp_path="$(cd "$(dirname "$seccomp_path")" && pwd)/$(basename "$seccomp_path")"
+  for sc in io_uring_setup io_uring_enter io_uring_register; do
+    grep -q "\"$sc\"" "$seccomp_path" \
+      || die "seccomp profile $seccomp_path does not list $sc -- wrong file? (expected vllm scripts/seccomp/spark-io-uring.json)"
+  done
+  seccomp_args=(--security-opt "seccomp=$seccomp_path"); seccomp_desc=$seccomp_path
+fi
+# Probe the image with exactly the seccomp the serve container will get.
+# io_uring_setup is syscall 425 on aarch64 and x86_64; with NULL params an
+# allowed kernel answers EFAULT, a blocking seccomp (or sysctl) answers EPERM.
+if [ "$LOAD_FORMAT" = b12x ] \
+   && command -v "$CONTAINER_RUNTIME" >/dev/null 2>&1 \
+   && "$CONTAINER_RUNTIME" image inspect "$SERVING_IMAGE" >/dev/null 2>&1; then
+  "$CONTAINER_RUNTIME" run --rm --entrypoint sh "$SERVING_IMAGE" -c 'pkg-config --exists liburing' >/dev/null 2>&1 \
+    || die "LOAD_FORMAT=b12x: $SERVING_IMAGE has no liburing development files, so the b12x loader dies with \"io_uring bounce support is unavailable\". Rebuild with PATCH_IO_URING=on (build-spark-cu132.sh), or use LOAD_FORMAT=instanttensor"
+  uring_probe="$("$CONTAINER_RUNTIME" run --rm "${seccomp_args[@]}" --entrypoint /opt/venv/bin/python "$SERVING_IMAGE" -c '
+import ctypes, errno
+libc = ctypes.CDLL(None, use_errno=True); libc.syscall(425, 0, 0)
+print("BLOCKED" if ctypes.get_errno() == errno.EPERM else "OK")' 2>&1 || true)"
+  case "$uring_probe" in
+    *BLOCKED*) die "io_uring is BLOCKED in the container under seccomp '$seccomp_desc' (EPERM). Check the profile, and the host: sysctl kernel.io_uring_disabled must be 0" ;;
+    *OK*) ;;
+    *) warn "io_uring probe inconclusive (${uring_probe:-no output}); the load will tell" ;;
+  esac
+fi
+# ===== END shared block: b12x loader io_uring =====
+
 command=(
   "$CONTAINER_RUNTIME" run -d
   --name "$container_name"
@@ -1349,6 +1777,7 @@ command=(
   --ulimit memlock=-1:-1
   "${memory_args[@]}"
   --device /dev/infiniband
+  "${seccomp_args[@]}"   # b12x loader io_uring (shared block above)
   "${mount_args[@]}"
   --env-file "$env_file"
   # The image bakes VLLM_PCIE_ALLREDUCE_BACKEND=cpp (pre-rename); vLLM
@@ -1358,9 +1787,10 @@ command=(
   "${precision_env_args[@]}"
   "${dcp_env_args[@]}"
   "${profile_env_args[@]}"
+  "${instanttensor_env_args[@]}"
   --entrypoint /opt/venv/bin/vllm
   "$SERVING_IMAGE"
-  serve "$serving_container_path"
+  serve "$serve_path"
 
   # --- topology -----------------------------------------------------------
   --tensor-parallel-size 2
@@ -1378,9 +1808,10 @@ command=(
   --block-size "$BLOCK_SIZE"
 
   # --- model / kernels (FP4-CSF: the reader owns the routed experts) -------
+  # Recipe CSF: --load-format = LOAD_FORMAT; nvfp4_csf image: nvfp4_csf.
   --dtype bfloat16
-  --quantization nvfp4_csf
-  --load-format nvfp4_csf
+  --quantization "$csf_quantization"
+  --load-format "$csf_load_format"
   --attention-backend "$ATTENTION_BACKEND"
   --moe-backend "$MOE_BACKEND"
   --linear-backend "$LINEAR_BACKEND"
@@ -1426,11 +1857,26 @@ fi
 
 printf "Local rank input checks passed.\n"
 printf '  rank:                    %s\n' "$NODE_RANK"
-printf '  checkpoint:              %s (%s shards, %s GB)\n' "$MODEL_HOST_PATH" "$csf_shards" "$(awk -v b="$csf_bytes" 'BEGIN{printf "%.1f", b/1e9}')"
-printf '  checkpoint identity:     %s (must match on both ranks)\n' "$csf_identity"
-printf '  serving dir:             %s -> %s\n' "$csf_serving_host" "$serving_container_path"
+printf '  checkpoint:              %s (%s layout%s, %s shards, %s GB)\n' "$MODEL_HOST_PATH" "$csf_layout" \
+  "$(case "$csf_revision" in -) ;; mixed) printf ', MIXED revisions' ;; *) printf ', revision %s' "${csf_revision:0:12}" ;; esac)" \
+  "$csf_shards" "$(awk -v b="$csf_bytes" 'BEGIN{printf "%.1f", b/1e9}')"
+[ -z "$CHECKPOINT_REVISION" ] || printf '  checkpoint revision:     %s (CHECKPOINT_REVISION %s)\n' "${csf_revision:0:12}" "$CHECKPOINT_REVISION"
+printf '  checkpoint identity:     %s (must match on both ranks%s)\n' "$csf_identity" \
+  "$(case "$csf_lil" in match) printf '; = blackwell-llm-docker pinned content' ;; mismatch) printf '; DIFFERS from the pinned content' ;; esac)"
+if [ -n "$csf_serving_host" ]; then
+  printf '  serving dir:             %s -> %s\n' "$csf_serving_host" "$serving_container_path"
+else
+  printf '  serving dir:             none (vLLM reads %s directly)\n' "$model_container_path"
+fi
+printf '  vision tower:            %s\n' "$(if [ "$LANGUAGE_MODEL_ONLY" = 1 ]; then echo 'off (LANGUAGE_MODEL_ONLY=1)'; elif [ "$csf_vision_stored" = 1 ]; then echo 'stored recipes (checkpoint)'; elif [ "${VLLM_GLM53_VISION_MXFP8:-0}" = 1 ]; then echo 'BF16 checkpoint, MXFP8 at load'; else echo 'BF16'; fi)"
+printf '  vocabulary heads:        verifier %s; draft %s\n' \
+  "$([ "${VLLM_MXFP8_LM_HEAD:-0}" = 1 ] && echo MXFP8 || echo BF16)" \
+  "$(if [ "${VLLM_MTP_NVFP4_LM_HEAD:-1}" = 1 ]; then echo 'own NVFP4 head (path A)'; elif [ "$draft_head" = nvfp4 ]; then echo 'NVFP4 copy of the BF16 target head (path B)'; else echo 'shares the verifier head'; fi)"
 [ "$SPECULATOR" != dflash2 ] || printf '  draft model:             %s\n' "$DFLASH_MODEL_HOST_PATH"
 printf '  image:                   %s (%s)\n' "$SERVING_IMAGE" "$image_desc"
+printf '  CSF load:                --quantization %s --load-format %s%s\n' "$csf_quantization" "$csf_load_format" \
+  "$(case "$csf_load_format" in instanttensor) printf ' (buffer %s, depth %s, concurrency %s, chunk %s)' "$INSTANTTENSOR_BUFFER_SIZE" "$INSTANTTENSOR_IO_DEPTH" "$INSTANTTENSOR_CONCURRENCY" "$INSTANTTENSOR_CHUNK_SIZE" ;; esac)"
+printf '  seccomp:                 %s\n' "$seccomp_desc"
 printf '  precision:               %s\n' "$precision_desc"
 printf '  parallelism:             TP2 x DCP%s\n' "$DCP_SIZE"
 printf '  SPECULATOR:              %s (%s draft tokens, %s / %s%s)\n' "$SPECULATOR" "$NUM_SPECULATIVE_TOKENS" "$DRAFT_SAMPLE_METHOD" "$REJECTION_SAMPLE_METHOD" \
